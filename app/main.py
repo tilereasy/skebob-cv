@@ -1,6 +1,7 @@
 import cv2
 import csv
 import math
+import numpy as np
 from pathlib import Path
 from collections import Counter
 from ultralytics import YOLO
@@ -9,13 +10,14 @@ from ultralytics import YOLO
 #       НАСТРОЙКИ ПУТЕЙ
 # ==============================
 
-VIDEO_PATH = "data/input/video.mp4"                 # входное видео
+VIDEO_PATH = "data/input/short_video.mp4"                 # входное видео
 OUTPUT_VIDEO_PATH = "data/output/depo_tracked.mp4"  # видео с боксами, ролями, активностями
-OUTPUT_CSV_PATH = "output/depo_tracks.csv"     # лог в CSV
+OUTPUT_CSV_PATH = "data/output/depo_tracks.csv"     # лог в CSV
+OUTPUT_HEATMAP_PATH = "data/output/depo_heatmap.png"  # тепловая карта по всем кадрам
 
-DET_MODEL_PATH = "models/yolo11m.pt"     # ДОобученная detect-модель (person/train)
-CLS_MODEL_PATH = "models/yolo11s-cls"   # ДОобученная cls-модель ролей (worker/other/...)
-TRACKER_CFG = "models/custom_bytetrack.yaml"            # конфиг трекера
+DET_MODEL_PATH = "models/yolo11m.pt"        # detect-модель (person/train)
+CLS_MODEL_PATH = "models/yolo11s-cls.pt"    # cls-модель ролей (worker/other/...)
+TRACKER_CFG = "models/custom_bytetrack.yaml"  # конфиг трекера
 
 # ==============================
 #   ПАРАМЕТРЫ ДЕТЕКТОРА/ТРЕКЕРА
@@ -48,24 +50,37 @@ FPS = 25  # обновится из видео
 
 STILL_MAX_SPEED = 10       # px/сек — стоит/почти не двигается
 WALK_SPEED_MIN = 10        # px/сек — начинается ходьба
-WALK_SPEED_MAX = 120       # px/сек — быстрые перемещения
+WALK_SPEED_MAX = 120       # px/сек — быстрые перемещения (на будущее, если пригодится)
 
-NEAR_TRAIN_MAX_DIST = 250  # px — ближе этого считаем "возле поезда"
-
-MOTION_WINDOW = 5          # окно для вычисления скорости/дисперсии высоты
+MOTION_WINDOW = 5          # окно для скорости
 ACTIVITY_WINDOW = 15       # окно для сглаживания активности
-ACTIVITY_RECALC_EVERY = 5  # как часто пересчитывать активность (в кадрах)
-
-NEAR_TRAIN_MIN_FRAMES = 15    # минимум кадров подряд возле поезда для "working"
-HEIGHT_VAR_WORK_MIN = 20.0    # порог дисперсии высоты для "working"
 
 # ==============================
 #        ЗОНЫ В КАДРЕ
 # ==============================
 
-# заглушки, реальные зоны зададим после чтения видео
+# Прямоугольные зоны — можно оставить как есть, используются только для "walk"/"work" меток
 WORK_ZONE = (0, 0, 1000, 1000)
 WALK_ZONE = (0, 0, 1000, 1000)
+
+# ==============================
+#    ПОЛИГОН ЗОНЫ ПОЕЗДА
+# ==============================
+
+# НОРМАЛИЗОВАННЫЕ координаты полигона поезда (x,y в диапазоне [0..1] от ширины/высоты кадра)
+TRAIN_POLYGON_NORM = [
+    (0.48, 0.22),
+    (0.59, 1),
+    (1, 1),
+    (0.53, 0.22),
+]
+TRAIN_POLYGON = []  # сюда положим пиксельные координаты после чтения видео
+
+# ==============================
+#       ТЕПЛОВАЯ КАРТА
+# ==============================
+
+HEATMAP_DOWNSCALE = 4  # 4 → карта ~ в 16 раз меньше по пикселям
 
 # ==============================
 #       ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -79,7 +94,7 @@ def point_in_rect(x, y, rect):
 def get_zone_label(cx, cy):
     """
     Возвращает:
-      'work' — рабочая зона возле поезда
+      'work' — рабочая зона
       'walk' — проход
       'other' — остальное
     """
@@ -90,22 +105,35 @@ def get_zone_label(cx, cy):
     return "other"
 
 
-def distance_to_train(cx, cy, train_bbox):
+def point_in_polygon(x, y, polygon):
     """
-    Расстояние от точки (cx, cy) до центра поезда.
-    Если поезда нет — inf.
+    Классический ray casting алгоритм.
+    x, y — точка
+    polygon — список (x_i, y_i)
     """
-    if train_bbox is None:
-        return float("inf")
-    x1t, y1t, x2t, y2t = train_bbox
-    ctx = (x1t + x2t) / 2.0
-    cty = (y1t + y2t) / 2.0
-    return math.hypot(cx - ctx, cy - cty)
+    n = len(polygon)
+    if n < 3:
+        return False
+
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+
+        # Проверка, пересекает ли ребро луч справа от точки
+        intersect = ((yi > y) != (yj > y)) and \
+                    (x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi)
+        if intersect:
+            inside = not inside
+        j = i
+
+    return inside
 
 
 def classify_person_crop(crop_bgr, cls_model, cls_names):
     """
-    Классификация кропа человека через твою YOLO-cls модель.
+    Классификация кропа человека через YOLO-cls.
     Возвращает:
       role_label – строковая метка (напр. 'worker', 'other')
       conf       – вероятность top1
@@ -120,10 +148,9 @@ def classify_person_crop(crop_bgr, cls_model, cls_names):
 
 def update_track_role(state, frame_idx, new_role, new_conf):
     """
-    Обновление роли в state["role"]:
+    Обновление роли:
       - игнорируем слабые предсказания
-      - храним историю последних ROLE_WINDOW меток
-      - current_role = мода по окну
+      - current_role = мода по последним ROLE_WINDOW меткам
     """
     role_state = state.setdefault("role", {
         "current_role": "",
@@ -144,8 +171,8 @@ def update_track_role(state, frame_idx, new_role, new_conf):
     confs.append(new_conf)
 
     if len(labels) > ROLE_WINDOW:
-        labels = labels[-ROLE_WINDOW:]
-        confs = confs[-ROLE_WINDOW:]
+        labels[:] = labels[-ROLE_WINDOW:]
+        confs[:] = confs[-ROLE_WINDOW:]
 
     role_state["labels_history"] = labels
     role_state["confs_history"] = confs
@@ -167,30 +194,22 @@ def update_track_motion(state, frame_idx, cx, cy, h, fps):
     """
     Обновляет:
       - историю позиций
-      - историю высот bbox
       - скорость (px/сек)
-      - дисперсию высот (height_var)
+      (высоту можно оставить на будущее, сейчас не используем)
     """
     motion = state.setdefault("motion", {
         "positions": [],
-        "heights": [],
         "speed": 0.0,
-        "height_var": 0.0,
     })
 
     positions = motion["positions"]
-    heights = motion["heights"]
-
     positions.append((frame_idx, cx, cy))
-    heights.append(h)
 
     if len(positions) > MOTION_WINDOW:
         positions[:] = positions[-MOTION_WINDOW:]
-        heights[:] = heights[-MOTION_WINDOW:]
 
     if len(positions) < 2:
         motion["speed"] = 0.0
-        motion["height_var"] = 0.0
         return
 
     f0, x0, y0 = positions[0]
@@ -201,109 +220,26 @@ def update_track_motion(state, frame_idx, cx, cy, h, fps):
     speed_px_per_sec = dist * (fps / df)
     motion["speed"] = speed_px_per_sec
 
-    if len(heights) >= 2:
-        mean_h = sum(heights) / len(heights)
-        var_h = sum((hh - mean_h) ** 2 for hh in heights) / len(heights)
-        motion["height_var"] = var_h
-    else:
-        motion["height_var"] = 0.0
 
-
-def infer_activity(is_worker, zone, speed, dist_train, height_var, near_train_frames):
+def infer_activity(zone, speed, in_train_zone):
     """
-    Улучшенная логика активности:
-      - учитывает длительность нахождения возле поезда (near_train_frames)
-      - учитывает "ёрзание" по высоте bbox (height_var)
+    Простая и понятная логика активности:
+      - если человек в полигоне поезда → working
+      - иначе:
+          speed > WALK_SPEED_MIN  → walking
+          speed < STILL_MAX_SPEED → idle
+          иначе → walking (чтоб не плодить лишние состояния)
     """
-    if not is_worker:
-        return "irrelevant"
+    if in_train_zone:
+        return "working"
 
-    is_near_train = (dist_train <= NEAR_TRAIN_MAX_DIST)
-
-    # worker в рабочей зоне возле поезда
-    if zone == "work" and is_near_train:
-        # только что подошёл
-        if near_train_frames < NEAR_TRAIN_MIN_FRAMES:
-            if speed > WALK_SPEED_MIN:
-                return "walking"
-            else:
-                return "idle"
-
-        # достаточно долго у поезда
-        if speed <= WALK_SPEED_MAX and height_var >= HEIGHT_VAR_WORK_MIN:
-            return "working"
-
-        if speed <= STILL_MAX_SPEED:
-            return "idle"
-
-        if speed > WALK_SPEED_MIN:
-            return "walking"
-
-        return "idle"
-
-    # worker в проходе
-    if zone == "walk":
-        if speed > WALK_SPEED_MIN:
-            return "walking"
-        else:
-            return "idle"
-
-    # worker в других зонах
     if speed > WALK_SPEED_MIN:
         return "walking"
-    else:
+
+    if speed < STILL_MAX_SPEED:
         return "idle"
 
-
-def update_track_activity(state, frame_idx, is_worker, zone, speed, dist_train, height_var):
-    """
-    Обновляет state["activity"]:
-      - поддерживает счётчик кадров возле поезда
-      - считает "сырую" активность через infer_activity
-      - сглаживает её по окну ACTIVITY_WINDOW
-      - добавляет лёгкий гистерезис для 'working'
-    """
-    activity_state = state.setdefault("activity", {
-        "current_activity": "idle",
-        "history": [],
-        "last_frame": -ACTIVITY_RECALC_EVERY,
-        "near_train_frames": 0,
-    })
-
-    # обновляем near_train_frames каждый кадр
-    if is_worker and zone == "work" and dist_train <= NEAR_TRAIN_MAX_DIST:
-        activity_state["near_train_frames"] += 1
-    else:
-        activity_state["near_train_frames"] = 0
-
-    if frame_idx - activity_state["last_frame"] < ACTIVITY_RECALC_EVERY:
-        return activity_state
-
-    near_train_frames = activity_state["near_train_frames"]
-
-    raw_activity = infer_activity(
-        is_worker, zone, speed, dist_train, height_var, near_train_frames
-    )
-
-    hist = activity_state["history"]
-    hist.append(raw_activity)
-    if len(hist) > ACTIVITY_WINDOW:
-        hist[:] = hist[-ACTIVITY_WINDOW:]
-
-    counts = Counter(hist)
-    most_common_activity, _ = counts.most_common(1)[0]
-
-    # гистерезис: не даём сразу "упасть" из working в idle/walking
-    prev = activity_state["current_activity"]
-    if prev == "working" and most_common_activity in ("idle", "walking"):
-        num_non_work = sum(1 for a in hist if a != "working")
-        if num_non_work < len(hist) // 2:
-            most_common_activity = "working"
-
-    activity_state["current_activity"] = most_common_activity
-    activity_state["last_frame"] = frame_idx
-
-    return activity_state
+    return "walking"
 
 
 # ==============================
@@ -311,7 +247,7 @@ def update_track_activity(state, frame_idx, is_worker, zone, speed, dist_train, 
 # ==============================
 
 def main():
-    global WORK_ZONE, WALK_ZONE, FPS
+    global WORK_ZONE, WALK_ZONE, FPS, TRAIN_POLYGON
 
     if not Path(VIDEO_PATH).exists():
         raise FileNotFoundError(f"Видео не найдено: {VIDEO_PATH}")
@@ -329,12 +265,24 @@ def main():
 
     print(f"Видео: {width}x{height}, FPS={fps:.2f}")
 
-    # Пример: рабочая зона — левая 70%, проход — правая 30%
-    WORK_ZONE = (0, 0, int(width * 0.7), height)
-    WALK_ZONE = (int(width * 0.7), 0, width, height)
+    # Зоны "проход" и "работа" — для меток, не для логики working
+    WALK_ZONE = (0, 0, int(width * 0.48), height)
+    WORK_ZONE = (int(width * 0.48), 0, width, height)
+
+    # Полигон поезда в пикселях
+    TRAIN_POLYGON = [
+        (int(x * width), int(y * height))
+        for (x, y) in TRAIN_POLYGON_NORM
+    ]
 
     print(f"WORK_ZONE: {WORK_ZONE}")
     print(f"WALK_ZONE: {WALK_ZONE}")
+    print(f"TRAIN_POLYGON: {TRAIN_POLYGON}")
+
+    # тепловая карта (downscaled)
+    heatmap_h = height // HEATMAP_DOWNSCALE
+    heatmap_w = width // HEATMAP_DOWNSCALE
+    heatmap = np.zeros((heatmap_h, heatmap_w), dtype=np.float32)
 
     det_model = YOLO(DET_MODEL_PATH)
     cls_model = YOLO(CLS_MODEL_PATH)
@@ -351,12 +299,11 @@ def main():
         "frame", "track_id", "det_class_id", "det_class_name",
         "x1", "y1", "x2", "y2",
         "role", "role_conf",
-        "speed_px_per_sec", "zone", "dist_to_train_px",
-        "height_var", "activity"
+        "speed_px_per_sec", "zone",
+        "in_train_polygon", "activity"
     ])
 
     track_states = {}   # track_id -> state
-    last_train_bbox = None
 
     results_gen = det_model.track(
         source=VIDEO_PATH,
@@ -390,19 +337,6 @@ def main():
 
         h_frame, w_frame = frame.shape[:2]
 
-        # --- сначала найдём поезд в кадре ---
-        train_bbox_this_frame = None
-        for bbox, cls_id, track_id in zip(xyxy, cls_arr, ids):
-            class_id = int(cls_id)
-            if class_id == TRAIN_CLASS_ID:
-                x1t, y1t, x2t, y2t = map(int, bbox)
-                train_bbox_this_frame = (x1t, y1t, x2t, y2t)
-                break
-
-        if train_bbox_this_frame is not None:
-            last_train_bbox = train_bbox_this_frame
-
-        # --- обрабатываем все объекты ---
         for bbox, cls_id, track_id in zip(xyxy, cls_arr, ids):
             x1, y1, x2, y2 = map(int, bbox)
             w = x2 - x1
@@ -419,10 +353,9 @@ def main():
             current_role = ""
             role_conf = 0.0
             speed = 0.0
-            height_var = 0.0
             zone = ""
-            dist_train = float("inf")
             current_activity = ""
+            in_train_poly = False
 
             state = None
             if track_id != -1:
@@ -439,7 +372,6 @@ def main():
                 update_track_motion(state, frame_idx, cx, cy, h, fps)
                 motion_state = state.get("motion", {})
                 speed = motion_state.get("speed", 0.0)
-                height_var = motion_state.get("height_var", 0.0)
 
                 # роль
                 role_state = state.setdefault("role", {
@@ -471,26 +403,43 @@ def main():
                 role_conf = role_state["current_conf"]
 
                 zone = get_zone_label(cx, cy)
-                dist_train = distance_to_train(cx, cy, last_train_bbox)
-                is_worker = (current_role.lower() == "worker")
+                in_train_poly = point_in_polygon(cx, cy, TRAIN_POLYGON)
 
-                activity_state = update_track_activity(
-                    state, frame_idx, is_worker, zone, speed, dist_train, height_var
-                )
-                current_activity = activity_state["current_activity"]
+                # активность + сглаживание по окну
+                activity_state = state.setdefault("activity", {
+                    "current_activity": "",
+                    "history": [],
+                })
+                raw_activity = infer_activity(zone, speed, in_train_poly)
+
+                hist = activity_state["history"]
+                hist.append(raw_activity)
+                if len(hist) > ACTIVITY_WINDOW:
+                    hist[:] = hist[-ACTIVITY_WINDOW:]
+
+                counts = Counter(hist)
+                current_activity, _ = counts.most_common(1)[0]
+                activity_state["current_activity"] = current_activity
+
+                # тепловая карта: все, кто "working" (без проверки роли)
+                if current_activity == "working":
+                    hx = int(cx / HEATMAP_DOWNSCALE)
+                    hy = int(cy / HEATMAP_DOWNSCALE)
+                    if 0 <= hx < heatmap_w and 0 <= hy < heatmap_h:
+                        heatmap[hy, hx] += 1.0
 
             # --- цвет бокса ---
             if det_class_name == "person":
                 if current_activity == "working":
-                    color = (0, 255, 0)
+                    color = (0, 255, 0)        # зелёный — работает
                 elif current_activity == "walking":
-                    color = (255, 255, 0)
+                    color = (255, 255, 0)      # жёлтый — идёт
                 elif current_activity == "idle":
-                    color = (0, 215, 255)
+                    color = (0, 215, 255)      # оранжевый — стоит
                 else:
-                    color = (0, 255, 255)
+                    color = (0, 255, 255)      # если что-то не определилось
             elif det_class_name == "train":
-                color = (0, 0, 255)
+                color = (0, 0, 255)            # красный — поезд
             else:
                 color = (255, 0, 255)
 
@@ -523,17 +472,33 @@ def main():
                 f"{role_conf:.3f}",
                 f"{speed:.1f}",
                 zone,
-                f"{dist_train:.1f}" if dist_train != float("inf") else "",
-                f"{height_var:.1f}",
+                int(in_train_poly),
                 current_activity,
             ])
 
         out_writer.write(frame)
 
-    print("Готово.")
+    print("Обработка видео завершена.")
+
     out_writer.release()
     csv_file.close()
     cv2.destroyAllWindows()
+
+    # ==============================
+    #   ГЕНЕРАЦИЯ ТЕПЛОВОЙ КАРТЫ
+    # ==============================
+
+    if np.max(heatmap) > 0:
+        heat_norm = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX)
+        heat_uint8 = heat_norm.astype(np.uint8)
+        heat_color = cv2.applyColorMap(heat_uint8, cv2.COLORMAP_JET)
+        heat_color_resized = cv2.resize(heat_color, (width, height), interpolation=cv2.INTER_LINEAR)
+
+        cv2.imwrite(OUTPUT_HEATMAP_PATH, heat_color_resized)
+        print(f"Тепловая карта сохранена в: {OUTPUT_HEATMAP_PATH}")
+    else:
+        print("Тепловая карта пустая (никто не был в состоянии 'working').")
+
     print(f"Видео сохранено в: {OUTPUT_VIDEO_PATH}")
     print(f"CSV лог:          {OUTPUT_CSV_PATH}")
 
