@@ -1,0 +1,9 @@
+path: ./datasets
+
+train: images
+val: images
+
+names:
+  0: person
+  1: worker
+  2: train
