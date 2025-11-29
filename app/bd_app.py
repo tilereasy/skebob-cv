@@ -55,7 +55,7 @@ class Train(Base):
 class Second(Base):
     __tablename__ = "seconds"
     id = Column(Integer, primary_key=True)
-    sequence_number = Column(Integer, nullable=False)  # порядковый номер в поезде
+    sequence_number = Column(Integer, nullable=False)  # порядковый номер в секунды
     timestamp = Column(TIMESTAMP, default=datetime.utcnow, nullable=False)
     people_count = Column(Integer, default=0)
     active_people_count = Column(Integer, default=0)
