@@ -4,6 +4,7 @@ ASYNC SQLAlchemy + asyncpg
 - создаёт таблицы
 - содержит async CRUD
 - готов для интеграции с нейронкой
+- Second теперь имеет sequence_number и timestamp
 """
 
 import os
@@ -12,7 +13,7 @@ from typing import Optional, List
 
 from sqlalchemy import (
     Column, Integer, String, Float, TIMESTAMP,
-    ForeignKey
+    ForeignKey, select, func
 )
 from sqlalchemy.ext.asyncio import (
     create_async_engine, AsyncSession
@@ -54,6 +55,8 @@ class Train(Base):
 class Second(Base):
     __tablename__ = "seconds"
     id = Column(Integer, primary_key=True)
+    sequence_number = Column(Integer, nullable=False)  # порядковый номер в поезде
+    timestamp = Column(TIMESTAMP, default=datetime.utcnow, nullable=False)
     people_count = Column(Integer, default=0)
     active_people_count = Column(Integer, default=0)
     activity_index = Column(Float, default=0.0)
@@ -142,8 +145,17 @@ async def delete_train(db: AsyncSession, train_id: int):
 async def create_second(db: AsyncSession, train_id: int,
                         people_count=0, active_people_count=0,
                         activity_index=0.0):
+    # Получаем последний sequence_number для данного поезда
+    result = await db.execute(
+        select(func.max(Second.sequence_number)).where(Second.train_id == train_id)
+    )
+    last_seq = result.scalar()
+    seq_num = (last_seq or 0) + 1
+
     s = Second(
         train_id=train_id,
+        sequence_number=seq_num,
+        timestamp=datetime.utcnow(),
         people_count=people_count,
         active_people_count=active_people_count,
         activity_index=activity_index
@@ -263,14 +275,12 @@ async def record_frame_activity(
     """
     Главная функция для интеграции с нейронкой:
     - найдёт поезд или создаст
-    - создаст Second
+    - создаст Second с sequence_number и timestamp
     - создаст/найдёт людей
     - создаст SecondsPeople
     """
 
     # найти поезд
-    from sqlalchemy.future import select
-
     result = await db.execute(
         select(Train).where(Train.number == train_number)
     )
@@ -279,6 +289,7 @@ async def record_frame_activity(
     if not train:
         train = await create_train(db, number=train_number)
 
+    # создать Second
     second = await create_second(
         db,
         train_id=train.id,
@@ -287,7 +298,7 @@ async def record_frame_activity(
         activity_index=activity_index
     )
 
-    # люди
+    # обработка людей
     for p in people_info:
         worker_type = p.get("worker_type", "unknown")
 
@@ -329,6 +340,12 @@ if __name__ == "__main__":
                 ]
             )
 
-            print("Second created:", sec.id)
+            print("Second created:")
+            print(f"  id: {sec.id}")
+            print(f"  sequence_number: {sec.sequence_number}")
+            print(f"  timestamp: {sec.timestamp}")
+            print(f"  people_count: {sec.people_count}")
+            print(f"  active_people_count: {sec.active_people_count}")
+            print(f"  activity_index: {sec.activity_index}")
 
     asyncio.run(main())
