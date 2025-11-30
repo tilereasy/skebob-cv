@@ -1,28 +1,6 @@
-# dashboard.py
-"""
-Дашборд визуализации активности людей на видео поезда.
-
-Схема компоновки:
-
-СЛЕВА:
-- Проигрыватель видео (оригинал / размеченное / тепловая карта)
-- Переключатель режима
-- Слайдер текущей секунды
-- Таблица "кто сейчас в кадре"
-
-СПРАВА:
-- Плашка о поезде (номер, прибытие, отбытие)
-- KPI по видео
-- Таблица "опасных" моментов (таймкоды самых высоких activity_index)
-- График: всего людей, работающих людей, индекс активности
-  + вертикальная пунктирная линия на текущей секунде
-
-db_app.py менять НЕЛЬЗЯ — только используем его модели и AsyncSessionLocal.
-"""
-
 import os
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -32,9 +10,9 @@ from db_app import AsyncSessionLocal, Train, Second, SecondsPeople, People
 from sqlalchemy import select
 
 
-# -------------------------------------------------------------------
-# ПУТИ К ДАННЫМ (ИСПОЛЬЗУЕМ РОВНО КАК ЗАДАНО)
-# -------------------------------------------------------------------
+# --------------------
+# Пути и окружение
+# --------------------
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parent
@@ -51,668 +29,402 @@ LABELED_VIDEO_PATH = OUTPUT_DIR / LABELED_VIDEO_FILENAME
 HEATMAP_FILENAME = "heatmap.png"
 HEATMAP_PATH = OUTPUT_DIR / HEATMAP_FILENAME
 
-# Режимы воспроизведения
-VIDEO_MODES = ["Видео", "Размеченное видео", "Тепловая карта"]
+print("APP_DIR      =", APP_DIR)
+print("PROJECT_ROOT =", PROJECT_ROOT)
+print("INPUT_DIR    =", INPUT_DIR)
+print("OUTPUT_DIR   =", OUTPUT_DIR)
+print("VIDEO_PATH   =", VIDEO_PATH, "| exists:", VIDEO_PATH.exists())
 
-# Кэш секунд по поездам (ключ — номер поезда)
-SECONDS_CACHE: Dict[str, pd.DataFrame] = {}
+if VIDEO_PATH.exists():
+    VIDEO_FORMAT = VIDEO_PATH.suffix[1:].lower() or "mov"
+else:
+    VIDEO_FORMAT = "mov"
 
+VIDEO_PATHS = {
+    "Видео": VIDEO_PATH,
+    "Размеченное видео": LABELED_VIDEO_PATH,
+    # "Тепловая карта" показываем через gr.Image (HEATMAP_PATH)
+}
 
-# -------------------------------------------------------------------
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ БД
-# -------------------------------------------------------------------
-
-async def load_all_trains():
-    """Получить список всех поездов из БД."""
-    async with AsyncSessionLocal() as db:
-        res = await db.execute(select(Train).order_by(Train.id))
-        return list(res.scalars().all())
-
-
-async def get_train_by_number(train_number: str) -> Optional[Train]:
-    """Получить объект Train по его номеру."""
-    async with AsyncSessionLocal() as db:
-        res = await db.execute(select(Train).where(Train.number == train_number))
-        return res.scalar_one_or_none()
+# Один фиксированный поезд; логика по секундам строится ВНУТРИ этого рейса
+TRAIN_NUMBER = os.getenv("TRAIN_NUMBER", "Train-001")
 
 
-async def load_seconds_df(train_number: str) -> pd.DataFrame:
+# --------------------
+# Рендеринг графиков и текста
+# --------------------
+
+def make_main_figure(seconds_df: pd.DataFrame) -> go.Figure:
     """
-    Загрузить все секунды для поезда с указанным номером в DataFrame.
-    Результат кешируется в SECONDS_CACHE.
-    """
-    if train_number in SECONDS_CACHE:
-        return SECONDS_CACHE[train_number]
-
-    async with AsyncSessionLocal() as db:
-        # Берём все секунды по join-у с поездом по номеру
-        res = await db.execute(
-            select(Second)
-            .join(Train, Second.train_id == Train.id)
-            .where(Train.number == train_number)
-            .order_by(Second.sequence_number)
-        )
-        seconds = list(res.scalars().all())
-
-    if not seconds:
-        df = pd.DataFrame(
-            columns=[
-                "id",
-                "sequence_number",
-                "timestamp",
-                "people_count",
-                "active_people_count",
-                "activity_index",
-            ]
-        )
-        SECONDS_CACHE[train_number] = df
-        return df
-
-    df = pd.DataFrame(
-        [
-            {
-                "id": s.id,
-                "sequence_number": s.sequence_number,
-                "timestamp": s.timestamp,
-                "people_count": s.people_count,
-                "active_people_count": s.active_people_count,
-                "activity_index": s.activity_index,
-            }
-            for s in seconds
-        ]
-    )
-    SECONDS_CACHE[train_number] = df
-    return df
-
-
-async def get_people_for_second(
-    train_number: str,
-    sequence_number: int,
-    seconds_df: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
-    """
-    Получить людей, которые находятся в кадре на указанной секунде видео
-    данного поезда.
-
-    Возвращает DataFrame с колонками:
-    - person_id
-    - worker_type (специальность)
-    - status      (активность)
-    """
-    if seconds_df is None:
-        seconds_df = await load_seconds_df(train_number)
-
-    if seconds_df.empty:
-        return pd.DataFrame(columns=["person_id", "worker_type", "status"])
-
-    row = seconds_df[seconds_df["sequence_number"] == sequence_number]
-    if row.empty:
-        return pd.DataFrame(columns=["person_id", "worker_type", "status"])
-
-    second_id = int(row["id"].iloc[0])
-
-    async with AsyncSessionLocal() as db:
-        res = await db.execute(
-            select(SecondsPeople, People)
-            .join(People, SecondsPeople.person_id == People.id)
-            .where(SecondsPeople.second_id == second_id)
-        )
-        rows = res.all()
-
-    people_records = [
-        {
-            "person_id": person.id,
-            "worker_type": person.worker_type,
-            "status": sp.status or "",
-        }
-        for sp, person in rows
-    ]
-
-    if not people_records:
-        return pd.DataFrame(columns=["person_id", "worker_type", "status"])
-
-    return pd.DataFrame.from_records(people_records)
-
-
-# -------------------------------------------------------------------
-# ФОРМАТИРОВАНИЕ ТЕКСТА / ГРАФИКОВ
-# -------------------------------------------------------------------
-
-def format_dt(dt) -> str:
-    if dt is None:
-        return "—"
-    try:
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return str(dt)
-
-
-def format_train_info_md(train: Optional[Train]) -> str:
-    """Markdown-плашка с информацией о поезде."""
-    if not train:
-        return "### Информация о поезде\n\nПоезд не выбран или отсутствует в БД."
-
-    return (
-        "### Информация о поезде\n\n"
-        f"- Номер: **{train.number}**  \n"
-        f"- Время прибытия: **{format_dt(train.arrival_time)}**  \n"
-        f"- Время отбытия: **{format_dt(train.departure_time)}**"
-    )
-
-
-def build_kpi_md(train: Optional[Train], seconds_df: pd.DataFrame) -> str:
-    """Собрать KPI по видео в виде Markdown."""
-    header = (
-        f"### KPI по видео поезда {train.number}\n\n"
-        if train
-        else "### KPI по видео\n\n"
-    )
-
-    if seconds_df.empty:
-        return header + "Нет данных по секундам для выбранного поезда."
-
-    duration_sec = int(seconds_df["sequence_number"].max())
-    avg_people = float(seconds_df["people_count"].mean())
-    avg_active = float(seconds_df["active_people_count"].mean())
-    avg_activity = float(seconds_df["activity_index"].mean())
-    max_activity = float(seconds_df["activity_index"].max())
-    max_row = seconds_df.loc[seconds_df["activity_index"].idxmax()]
-    max_t = int(max_row["sequence_number"])
-
-    return (
-        header
-        + f"- Длительность видео: **{duration_sec} с**  \n"
-        + f"- Среднее количество людей в кадре: **{avg_people:.1f}**  \n"
-        + f"- Среднее количество работающих людей: **{avg_active:.1f}**  \n"
-        + f"- Средний индекс активности: **{avg_activity:.2f}**  \n"
-        + f"- Пиковый индекс активности: **{max_activity:.2f}** на секунде **{max_t}**"
-    )
-
-
-def build_danger_table(seconds_df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
-    """
-    Таблица "опасных" моментов — топ-N секунд с максимальным activity_index.
-
-    Колонки:
-    - second          (секунда видео)
-    - timecode        (MM:SS)
-    - activity_index
-    - people_count
-    - active_people_count
+    График по seconds:
+      - people_count
+      - active_people_count
+      - activity_index
     """
     if seconds_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "second",
-                "timecode",
-                "activity_index",
-                "people_count",
-                "active_people_count",
-            ]
-        )
-
-    df = seconds_df.copy()
-    df = df.sort_values("activity_index", ascending=False).head(top_n)
-
-    def to_tc(s: int) -> str:
-        return f"{s // 60:02d}:{s % 60:02d}"
-
-    out = pd.DataFrame(
-        {
-            "second": df["sequence_number"].astype(int),
-            "timecode": df["sequence_number"].astype(int).map(to_tc),
-            "activity_index": df["activity_index"],
-            "people_count": df["people_count"],
-            "active_people_count": df["active_people_count"],
-        }
-    )
-
-    return out.reset_index(drop=True)
-
-
-def build_activity_figure(
-    seconds_df: pd.DataFrame,
-    current_second: Optional[int] = None,
-) -> go.Figure:
-    """График: всего людей, работающих людей и индекс активности."""
-    fig = go.Figure()
-
-    if seconds_df.empty:
-        fig.update_layout(
-            title="Нет данных по секундам для выбранного поезда",
-            xaxis_title="Секунда видео",
-            yaxis_title="Значения",
-            template="plotly_white",
-        )
-        return fig
+        return go.Figure()
 
     x = seconds_df["sequence_number"]
+
+    fig = go.Figure()
 
     fig.add_trace(
         go.Scatter(
             x=x,
             y=seconds_df["people_count"],
-            name="Всего людей",
             mode="lines",
+            name="Людей в кадре",
+            line=dict(color="#1f77b4"),
         )
     )
+
     fig.add_trace(
         go.Scatter(
             x=x,
             y=seconds_df["active_people_count"],
-            name="Работающие люди",
             mode="lines",
+            name="Работающих людей",
+            line=dict(color="#2ca02c"),
         )
     )
+
     fig.add_trace(
         go.Scatter(
             x=x,
             y=seconds_df["activity_index"],
-            name="Индекс активности",
             mode="lines",
-            line=dict(dash="dot"),
+            name="Индекс активности",
             yaxis="y2",
+            line=dict(color="#ff7f0e", dash="dot"),
         )
     )
 
     fig.update_layout(
-        xaxis_title="Секунда видео",
-        yaxis=dict(
-            title="Количество людей",
-            side="left",
-        ),
+        title=f"Поезд {TRAIN_NUMBER}: люди, работающие люди и индекс активности",
+        xaxis=dict(title="Время, сек (sequence_number)"),
+        yaxis=dict(title="Количество людей"),
         yaxis2=dict(
             title="Индекс активности",
             overlaying="y",
             side="right",
+            range=[0, 1],
         ),
         template="plotly_white",
-        legend=dict(orientation="h", x=0, y=1.15),
-        margin=dict(l=50, r=60, t=40, b=40),
-        height=320,
+        margin=dict(l=40, r=40, t=40, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
-
-    if current_second is not None:
-        fig.add_vline(
-            x=current_second,
-            line_dash="dash",
-            line_color="black",
-            annotation_text=f"t={current_second} c",
-            annotation_position="top right",
-        )
 
     return fig
 
 
-def slider_update_for_seconds(seconds_df: pd.DataFrame):
-    """Сконфигурировать слайдер по данным секунд."""
+def kpi_markdown(seconds_df: pd.DataFrame) -> str:
+    """
+    KPI по видео:
+      - длительность;
+      - min/max active_people_count;
+      - средний activity_index.
+    """
     if seconds_df.empty:
-        return gr.update(
-            minimum=0,
-            maximum=0,
-            value=0,
-            step=1,
-            interactive=False,
-        )
+        return f"Нет данных по поезду **{TRAIN_NUMBER}**"
 
-    min_seq = int(seconds_df["sequence_number"].min())
-    max_seq = int(seconds_df["sequence_number"].max())
-    return gr.update(
-        minimum=min_seq,
-        maximum=max_seq,
-        value=min_seq,
-        step=1,
-        interactive=True,
+    total_seconds = seconds_df["sequence_number"].nunique()
+    duration_min = total_seconds // 60
+    duration_sec = total_seconds % 60
+
+    max_active = seconds_df["active_people_count"].max()
+    min_active = seconds_df["active_people_count"].min()
+    avg_activity = seconds_df["activity_index"].mean()
+
+    md = f"""
+**KPI по видео (поезд {TRAIN_NUMBER})**
+
+- Длительность видео: {total_seconds} сек (~{duration_min} мин {duration_sec} сек)
+- Минимум работающих людей в кадре за всё видео: {min_active}
+- Максимум работающих людей в кадре за всё видео: {max_active}
+- Средний индекс активности: {avg_activity:.2f}
+"""
+    return md
+
+
+def train_info_markdown(train: Optional[Train]) -> str:
+    """
+    Плашка о поезде: номер, прибытие, отправление.
+    """
+    if train is None:
+        return f"Поезд с номером **{TRAIN_NUMBER}** не найден в базе данных."
+
+    def fmt_dt(dt):
+        return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "не задано"
+
+    arrival = fmt_dt(train.arrival_time)
+    departure = fmt_dt(train.departure_time)
+
+    md = f"""
+### Информация о поезде
+
+- Номер поезда: **{train.number}**
+- Время прибытия: {arrival}
+- Время отправления: {departure}
+"""
+    return md
+
+
+# --------------------
+# Работа с БД (ВСЁ async, без asyncio.run)
+# --------------------
+
+async def load_seconds_df(db, train_number: str) -> pd.DataFrame:
+    """
+    seconds_df по поезду:
+      - id
+      - sequence_number
+      - people_count
+      - active_people_count
+      - activity_index
+    """
+    q_sec = (
+        select(
+            Second.id,
+            Second.sequence_number,
+            Second.people_count,
+            Second.active_people_count,
+            Second.activity_index,
+        )
+        .join(Train, Train.id == Second.train_id)
+        .where(Train.number == train_number)
+        .order_by(Second.sequence_number)
+    )
+    res_sec = await db.execute(q_sec)
+    rows = res_sec.all()
+    return pd.DataFrame(
+        rows,
+        columns=["id", "sequence_number", "people_count", "active_people_count", "activity_index"],
     )
 
 
-# -------------------------------------------------------------------
-# ОБРАБОТЧИКИ GRADIO (ASYNC)
-# -------------------------------------------------------------------
+async def load_train(db, train_number: str) -> Optional[Train]:
+    res = await db.execute(select(Train).where(Train.number == train_number))
+    return res.scalar_one_or_none()
 
-async def on_app_load():
+
+async def table_at_time_async(db, train_number: str, t_sec: float) -> pd.DataFrame:
     """
-    Инициализация интерфейса при загрузке:
-    - заполняем список поездов
-    - выбираем первый поезд
-    - подгружаем по нему секунды, KPI, график, "опасные" моменты
-    - таблицу людей для первой секунды
+    Главная штука "по секундам", как ты описал:
+
+    1. Берём секунду видео t_sec -> sequence_number = round(t_sec), минимум 1.
+    2. Для данной секунды и поезда находим всех людей:
+       join People + SecondsPeople + Second (+ Train).
+    3. Возвращаем:
+       - id человека
+       - worker_type
+       - status
     """
-    trains = await load_all_trains()
+    seq = int(round(float(t_sec or 0.0)))
+    if seq < 1:
+        seq = 1
 
-    # Если в БД нет поездов
-    if not trains:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(title="Нет данных", template="plotly_white")
-
-        empty_danger = pd.DataFrame(
-            columns=[
-                "second",
-                "timecode",
-                "activity_index",
-                "people_count",
-                "active_people_count",
-            ]
+    q = (
+        select(People.id, People.worker_type, SecondsPeople.status)
+        .join(SecondsPeople, SecondsPeople.person_id == People.id)
+        .join(Second, SecondsPeople.second_id == Second.id)
+        .join(Train, Train.id == Second.train_id)
+        .where(
+            Train.number == train_number,
+            Second.sequence_number == seq,
         )
-        empty_people = pd.DataFrame(
-            columns=["person_id", "worker_type", "status"]
-        )
-
-        return (
-            gr.update(choices=[], value=None, interactive=False),  # train_selector
-            "### Информация о поезде\n\nВ базе нет поездов.",      # train_info
-            gr.update(                                            # second_slider
-                minimum=0, maximum=0, value=0, step=1, interactive=False
-            ),
-            "### KPI по видео\n\nНет данных.",                    # kpi_markdown
-            empty_danger,                                         # danger_table
-            empty_fig,                                            # activity_plot
-            empty_people,                                         # people_table
-        )
-
-    # Поезда есть
-    train_numbers = [t.number for t in trains]
-    default_train = trains[0]
-    default_number = default_train.number
-
-    seconds_df = await load_seconds_df(default_number)
-    slider_update = slider_update_for_seconds(seconds_df)
-
-    if seconds_df.empty:
-        current_second = None
-    else:
-        current_second = int(seconds_df["sequence_number"].min())
-
-    train_info_md = format_train_info_md(default_train)
-    kpi_md = build_kpi_md(default_train, seconds_df)
-    danger_df = build_danger_table(seconds_df)
-    activity_fig = build_activity_figure(seconds_df, current_second)
-
-    if current_second is not None:
-        people_df = await get_people_for_second(
-            default_number, current_second, seconds_df
-        )
-    else:
-        people_df = pd.DataFrame(
-            columns=["person_id", "worker_type", "status"]
-        )
-
-    return (
-        gr.update(
-            choices=train_numbers,
-            value=default_number,
-            interactive=True,
-        ),                       # train_selector
-        train_info_md,           # train_info
-        slider_update,           # second_slider
-        kpi_md,                  # kpi_markdown
-        danger_df,               # danger_table
-        activity_fig,            # activity_plot
-        people_df,               # people_table
+        .order_by(People.id)
     )
+    res = await db.execute(q)
+    rows = res.all()
+
+    if not rows:
+        return pd.DataFrame(columns=["id", "worker_type", "status"])
+
+    df = pd.DataFrame(rows, columns=["id", "worker_type", "status"])
+    return df.sort_values("id").reset_index(drop=True)
 
 
-async def on_train_change(train_number: str):
+# --------------------
+# Переключение видео / теплокарты
+# --------------------
+
+def switch_media(mode: str):
     """
-    Смена поезда:
-    - обновить информацию о поезде
-    - пересчитать диапазон слайдера
-    - KPI, опасные моменты, график
-    - таблицу людей для первой секунды
+    'Видео' / 'Размеченное видео' -> gr.Video
+    'Тепловая карта'              -> gr.Image
     """
-    if not train_number:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(title="Нет данных", template="plotly_white")
+    video_update = gr.update(visible=False)
+    heatmap_update = gr.update(visible=False)
 
-        empty_danger = pd.DataFrame(
-            columns=[
-                "second",
-                "timecode",
-                "activity_index",
-                "people_count",
-                "active_people_count",
-            ]
-        )
-        empty_people = pd.DataFrame(
-            columns=["person_id", "worker_type", "status"]
-        )
+    if mode in ["Видео", "Размеченное видео"]:
+        path = VIDEO_PATHS.get(mode, VIDEO_PATH)
+        if path is not None and Path(path).exists():
+            video_update = gr.update(
+                value=str(path),
+                visible=True,
+            )
+        else:
+            video_update = gr.update(value=None, visible=True)
+        heatmap_update = gr.update(visible=False)
 
-        return (
-            "### Информация о поезде\n\nПоезд не выбран.",
-            gr.update(
-                minimum=0, maximum=0, value=0, step=1, interactive=False
-            ),
-            "### KPI по видео\n\nНет данных.",
-            empty_danger,
-            empty_fig,
-            empty_people,
-        )
+    elif mode == "Тепловая карта":
+        video_update = gr.update(visible=False)
+        if HEATMAP_PATH.exists():
+            heatmap_update = gr.update(
+                value=str(HEATMAP_PATH),
+                visible=True,
+            )
+        else:
+            heatmap_update = gr.update(value=None, visible=True)
 
-    train = await get_train_by_number(train_number)
-    seconds_df = await load_seconds_df(train_number)
-
-    train_info_md = format_train_info_md(train)
-    slider_update = slider_update_for_seconds(seconds_df)
-    kpi_md = build_kpi_md(train, seconds_df)
-    danger_df = build_danger_table(seconds_df)
-
-    if seconds_df.empty:
-        current_second = None
-    else:
-        current_second = int(seconds_df["sequence_number"].min())
-
-    activity_fig = build_activity_figure(seconds_df, current_second)
-
-    if current_second is not None:
-        people_df = await get_people_for_second(
-            train_number, current_second, seconds_df
-        )
-    else:
-        people_df = pd.DataFrame(
-            columns=["person_id", "worker_type", "status"]
-        )
-
-    return (
-        train_info_md,   # train_info
-        slider_update,   # second_slider
-        kpi_md,          # kpi_markdown
-        danger_df,       # danger_table
-        activity_fig,    # activity_plot
-        people_df,       # people_table
-    )
+    return video_update, heatmap_update
 
 
-async def on_second_change(train_number: str, second_value: float):
+# --------------------
+# Основной callback: ВСЁ из БД по текущему времени
+# --------------------
+
+async def update_by_time(current_t: float):
     """
-    Перемотка по слайдеру текущей секунды:
-    - двигаем вертикальную линию на графике
-    - обновляем таблицу людей в кадре
+    Вызывается каждые 0.5 сек.
+    Делает:
+      - seconds_df по поезду -> график и KPI;
+      - люди по секунде видео -> таблица;
+      - объект поезда -> плашка.
     """
-    if not train_number:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(title="Нет данных", template="plotly_white")
-        empty_people = pd.DataFrame(
-            columns=["person_id", "worker_type", "status"]
-        )
-        return empty_fig, empty_people
+    t = float(current_t or 0.0)
 
-    seq = int(second_value)
-    seconds_df = await load_seconds_df(train_number)
+    async with AsyncSessionLocal() as db:
+        seconds_df = await load_seconds_df(db, TRAIN_NUMBER)
+        table_df = await table_at_time_async(db, TRAIN_NUMBER, t)
+        train_obj = await load_train(db, TRAIN_NUMBER)
 
-    activity_fig = build_activity_figure(seconds_df, current_second=seq)
-    people_df = await get_people_for_second(train_number, seq, seconds_df)
+    fig = make_main_figure(seconds_df)
+    kpi_md = kpi_markdown(seconds_df)
+    train_md = train_info_markdown(train_obj)
 
-    return activity_fig, people_df
+    # main_plot, table_now, time_state, kpi_box, train_box
+    return fig, table_df, t, kpi_md, train_md
 
 
-def on_mode_change(mode: str):
-    """
-    Переключение режима воспроизведения:
+# --------------------
+# Начальные (пустые) значения
+# --------------------
 
-    - "Видео"           -> INPUT_DIR / "video.mov"
-    - "Размеченное..."  -> OUTPUT_DIR / "result.mov"
-    - "Тепловая карта"  -> OUTPUT_DIR / "heatmap.png" (отображаем как картинку)
-    """
-    if mode == "Видео":
-        video_path = str(VIDEO_PATH) if VIDEO_PATH.exists() else None
-        return (
-            gr.update(value=video_path, visible=True),  # video_player
-            gr.update(visible=False),                   # heatmap_image
-        )
-
-    if mode == "Размеченное видео":
-        labeled_path = (
-            str(LABELED_VIDEO_PATH) if LABELED_VIDEO_PATH.exists() else None
-        )
-        return (
-            gr.update(value=labeled_path, visible=True),
-            gr.update(visible=False),
-        )
-
-    # Тепловая карта
-    heatmap_path = str(HEATMAP_PATH) if HEATMAP_PATH.exists() else None
-    return (
-        gr.update(visible=False),                      # video_player
-        gr.update(value=heatmap_path, visible=True),   # heatmap_image
-    )
+EMPTY_TABLE = pd.DataFrame(columns=["id", "worker_type", "status"])
+EMPTY_FIG = go.Figure()
+INIT_KPI = f"Загрузка данных по поезду **{TRAIN_NUMBER}**..."
+INIT_TRAIN_MD = f"Загрузка информации о поезде **{TRAIN_NUMBER}**..."
 
 
-# -------------------------------------------------------------------
-# СБОРКА ИНТЕРФЕЙСА GRADIO
-# -------------------------------------------------------------------
+# --------------------
+# JS: читаем время видео
+# --------------------
 
-with gr.Blocks(title="Train Activity Dashboard") as demo:
-    gr.Markdown("## Дашборд анализа активности на видео поезда")
+READ_VIDEO_TIME_JS = """
+() => {
+  let video = null;
 
-    # Верхний ряд: выбор поезда + плашка поезда
+  const root = document.querySelector('#video_player');
+  if (root) {
+    const tag = (root.tagName || '').toLowerCase();
+    if (tag === 'video') {
+      video = root;
+    } else {
+      video = root.querySelector('video');
+    }
+  }
+
+  if (!video) {
+    video = document.querySelector('video');
+  }
+
+  if (!video) {
+    return 0;
+  }
+
+  return video.currentTime || 0;
+}
+"""
+
+
+# --------------------
+# UI
+# --------------------
+
+with gr.Blocks() as demo:
+    time_state = gr.State(0.0)
+    current_time = gr.Number(value=0.0, visible=False, label="current_time_sync")
+
     with gr.Row():
-        train_selector = gr.Dropdown(
-            label="Поезд",
-            choices=[],
-            value=None,
-            interactive=True,
-        )
-
-        train_info = gr.Markdown(
-            value="### Информация о поезде\n\nЗагрузка данных...",
-        )
-
-    # Основной блок: слева видео и таблица, справа KPI и графики
-    with gr.Row():
-        # Левая колонка: медиа + слайдер + таблица людей
         with gr.Column(scale=3):
-            video_player = gr.Video(
-                label="Видео",
+            video = gr.Video(
                 value=str(VIDEO_PATH) if VIDEO_PATH.exists() else None,
-                interactive=False,
+                format=VIDEO_FORMAT,
+                label="Видео",
+                elem_id="video_player",
+                visible=True,
             )
 
             heatmap_image = gr.Image(
-                label="Тепловая карта",
                 value=str(HEATMAP_PATH) if HEATMAP_PATH.exists() else None,
+                label="Тепловая карта",
                 visible=False,
             )
 
             mode_radio = gr.Radio(
-                VIDEO_MODES,
+                choices=["Видео", "Размеченное видео", "Тепловая карта"],
                 value="Видео",
-                label="Режим отображения",
-                interactive=True,
+                label="Режим воспроизведения",
             )
 
-            second_slider = gr.Slider(
-                label="Текущая секунда видео",
-                minimum=0,
-                maximum=0,
-                value=0,
-                step=1,
-                interactive=False,
-            )
-
-            people_table = gr.Dataframe(
-                headers=["person_id", "worker_type", "status"],
-                datatype=["number", "str", "str"],
-                row_count=(0, "dynamic"),
-                col_count=(3, "fixed"),
+            table_now = gr.Dataframe(
+                headers=["id", "worker_type", "status"],
+                value=EMPTY_TABLE,
                 label="Таблица с тем, что сейчас на экране",
+                interactive=False,
+                wrap=True,
             )
 
-        # Правая колонка: KPI, опасные моменты, график
         with gr.Column(scale=2):
-            kpi_markdown = gr.Markdown(
-                value="### KPI по видео\n\nЗагрузка...",
-                label="KPI",
-            )
+            train_box = gr.Markdown(value=INIT_TRAIN_MD)
+            kpi_box = gr.Markdown(value=INIT_KPI)
 
-            danger_table = gr.Dataframe(
-                headers=[
-                    "second",
-                    "timecode",
-                    "activity_index",
-                    "people_count",
-                    "active_people_count",
-                ],
-                datatype=["number", "str", "number", "number", "number"],
-                row_count=(0, "dynamic"),
-                col_count=(5, "fixed"),
-                label="Опасные моменты (по activity_index)",
-            )
+            with gr.Accordion("Danger highlights (картинки)", open=True):
+                danger_gallery = gr.Gallery(
+                    label="",
+                    columns=3,
+                    height="auto",
+                )
 
-            activity_plot = gr.Plot(
-                label="График: количество людей, работающих людей и индекс активности",
-            )
+            with gr.Accordion("График людей, работающих людей и индекса активности", open=True):
+                main_plot = gr.Plot(
+                    value=EMPTY_FIG,
+                )
 
-    # ----------------- ПРИВЯЗКА ОБРАБОТЧИКОВ -----------------
-
-    # Инициализация при загрузке страницы
-    demo.load(
-        fn=on_app_load,
-        inputs=None,
-        outputs=[
-            train_selector,
-            train_info,
-            second_slider,
-            kpi_markdown,
-            danger_table,
-            activity_plot,
-            people_table,
-        ],
+    # Таймер опрашивает видео на фронте
+    timer = gr.Timer(0.5)
+    timer.tick(
+        js=READ_VIDEO_TIME_JS,
+        outputs=current_time,
     )
 
-    # Смена поезда
-    train_selector.change(
-        fn=on_train_change,
-        inputs=[train_selector],
-        outputs=[
-            train_info,
-            second_slider,
-            kpi_markdown,
-            danger_table,
-            activity_plot,
-            people_table,
-        ],
+    # async callback: Gradio сам await-ит update_by_time
+    current_time.change(
+        fn=update_by_time,
+        inputs=current_time,
+        outputs=[main_plot, table_now, time_state, kpi_box, train_box],
     )
 
-    # Перемотка по секундам
-    second_slider.change(
-        fn=on_second_change,
-        inputs=[train_selector, second_slider],
-        outputs=[activity_plot, people_table],
-    )
-
-    # Переключение режима воспроизведения (видео / размеченное / тепловая карта)
     mode_radio.change(
-        fn=on_mode_change,
-        inputs=[mode_radio],
-        outputs=[video_player, heatmap_image],
+        fn=switch_media,
+        inputs=mode_radio,
+        outputs=[video, heatmap_image],
     )
 
-
-# -------------------------------------------------------------------
-# ТОЧКА ВХОДА
-# -------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Без queue() — максимально простой запуск.
-    # Запуск: python dashboard.py
-    demo.launch()
+    demo.launch(
+        debug=True,
+        allowed_paths=[str(INPUT_DIR), str(OUTPUT_DIR)],
+    )
