@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  cv-app:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@postgres:5432/postgres}
+      APP_MODE: ${APP_MODE:-all}
+      SKIP_DB_BOOTSTRAP: ${SKIP_DB_BOOTSTRAP:-0}
+    ports:
+      - "${APP_HTTP_PORT:-7860}:7860"
+    volumes:
+      - ../data:/app/data
+      - ../datasets:/app/datasets
+      - ../models:/app/models
+
+volumes:
+  postgres_data:
