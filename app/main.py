@@ -6,14 +6,30 @@ from pathlib import Path
 from collections import Counter
 from ultralytics import YOLO
 
+import asyncio
+from datetime import datetime, timedelta
+import re
+
+import easyocr  # OCR по естественным сценам
+
+from db_app import (
+    AsyncSessionLocal,
+    create_tables,
+    record_frame_activity,
+    Train,
+    create_train,
+    update_train,
+)
+from sqlalchemy import select
+
 # ==============================
 #       НАСТРОЙКИ ПУТЕЙ
 # ==============================
 
-VIDEO_PATH = "data/input/short_video.mp4"                 # входное видео
-OUTPUT_VIDEO_PATH = "data/output/depo_tracked.mp4"  # видео с боксами, ролями, активностями
-OUTPUT_CSV_PATH = "data/output/depo_tracks.csv"     # лог в CSV
-OUTPUT_HEATMAP_PATH = "data/output/depo_heatmap.png"  # тепловая карта по всем кадрам
+VIDEO_PATH = "data/input/video.mp4"                 # входное видео
+OUTPUT_VIDEO_PATH = "data/output/result.mp4"        # видео с боксами, ролями, активностями
+OUTPUT_CSV_PATH = "data/output/tracks.csv"           # лог в CSV
+OUTPUT_HEATMAP_PATH = "data/output/heatmap.png"      # тепловая карта по всем кадрам
 
 DET_MODEL_PATH = "models/yolo11m.pt"        # detect-модель (person/train)
 CLS_MODEL_PATH = "models/yolo11s-cls.pt"    # cls-модель ролей (worker/other/...)
@@ -25,32 +41,35 @@ TRACKER_CFG = "models/custom_bytetrack.yaml"  # конфиг трекера
 
 CONF_THRES = 0.4
 IOU_THRES = 0.5
-IMG_SIZE = 960
+IMG_SIZE = 640
 
-# подгони под свои ids в det-модели
+# индексы классов в det-модели
 PERSON_CLASS_ID = 0
 TRAIN_CLASS_ID = 1
 
-# ==============================
-#    ПАРАМЕТРЫ РОЛЕЙ (CLS-МОДЕЛЬ)
-# ==============================
-
-ROLE_CONF_MIN = 0.6        # ниже этого доверия не меняем роль
-ROLE_WINDOW = 10           # окно для сглаживания роли
-ROLE_RECLASSIFY_EVERY = 15 # как часто дёргать классификатор (в кадрах)
-
-MIN_PERSON_H = 60          # минимальная высота бокса для роли
-MIN_PERSON_W = 20          # минимальная ширина бокса для роли
+# обработка только каждого n-го кадра
+FRAME_STRIDE = 1  # 1 = каждый кадр, 3 = каждый третий и т.п.
 
 # ==============================
-#   ПАРАМЕТРЫ ДВИЖЕНИЯ/АКТИВНОСТИ
+#   ПАРАМЕТРЫ CLS-МОДЕЛИ РОЛЕЙ
+# ==============================
+
+ROLE_CONF_MIN = 0.6         # ниже этого доверия не меняем роль
+ROLE_WINDOW = 10            # окно для сглаживания роли
+ROLE_RECLASSIFY_EVERY = 15  # как часто дёргать классификатор (в кадрах)
+
+MIN_PERSON_H = 40           # минимальная высота бокса человека для CLS
+MIN_PERSON_W = 20           # минимальная ширина бокса человека для CLS
+
+# ==============================
+#   ПАРАМЕТРЫ СКОРОСТИ/АКТИВНОСТИ
 # ==============================
 
 FPS = 25  # обновится из видео
 
 STILL_MAX_SPEED = 10       # px/сек — стоит/почти не двигается
 WALK_SPEED_MIN = 10        # px/сек — начинается ходьба
-WALK_SPEED_MAX = 120       # px/сек — быстрые перемещения (на будущее, если пригодится)
+WALK_SPEED_MAX = 120       # px/сек — быстрые перемещения (на будущее)
 
 MOTION_WINDOW = 5          # окно для скорости
 ACTIVITY_WINDOW = 15       # окно для сглаживания активности
@@ -59,7 +78,6 @@ ACTIVITY_WINDOW = 15       # окно для сглаживания активн
 #        ЗОНЫ В КАДРЕ
 # ==============================
 
-# Прямоугольные зоны — можно оставить как есть, используются только для "walk"/"work" меток
 WORK_ZONE = (0, 0, 1000, 1000)
 WALK_ZONE = (0, 0, 1000, 1000)
 
@@ -67,11 +85,10 @@ WALK_ZONE = (0, 0, 1000, 1000)
 #    ПОЛИГОН ЗОНЫ ПОЕЗДА
 # ==============================
 
-# НОРМАЛИЗОВАННЫЕ координаты полигона поезда (x,y в диапазоне [0..1] от ширины/высоты кадра)
 TRAIN_POLYGON_NORM = [
     (0.48, 0.22),
-    (0.59, 1),
-    (1, 1),
+    (0.59, 1.0),
+    (1.0, 1.0),
     (0.53, 0.22),
 ]
 TRAIN_POLYGON = []  # сюда положим пиксельные координаты после чтения видео
@@ -83,8 +100,216 @@ TRAIN_POLYGON = []  # сюда положим пиксельные коорди�
 HEATMAP_DOWNSCALE = 4  # 4 → карта ~ в 16 раз меньше по пикселям
 
 # ==============================
+#   ПОЕЗД: OCR и логи прибытия
+# ==============================
+
+MIN_TRAIN_OCR_W = 80
+MIN_TRAIN_OCR_H = 40
+
+TRAIN_ABSENT_GRACE_FRAMES = 10
+MIN_TRAIN_PRESENCE_FRAMES = 20  # уточним после чтения FPS
+
+# OCR: EasyOCR + голосование по кадрам
+OCR_READER = easyocr.Reader(['ru', 'en'], gpu=True)
+MIN_OCR_VOTES = 5
+
+# ==============================
+#   СКРИНШОТЫ ПОДОЗРИТЕЛЬНЫХ
+# ==============================
+
+SCREENSHOT_DIR = "data/output/alerts"
+ALERT_COOLDOWN_SEC = 3.0   # минимум N секунд между скринами
+
+
+# ==============================
 #       ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================
+
+def ocr_train_number_from_bbox(frame, bbox):
+    """
+    OCR номера поезда из bbox поезда через EasyOCR.
+    Возвращает 'ЭП20-076' / 'ЭП20' / '076' или None.
+    """
+    x1, y1, x2, y2 = map(int, bbox)
+    h_frame, w_frame = frame.shape[:2]
+
+    x1 = max(0, min(x1, w_frame - 1))
+    x2 = max(0, min(x2, w_frame - 1))
+    y1 = max(0, min(y1, h_frame - 1))
+    y2 = max(0, min(y2, h_frame - 1))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    roi = frame[y1:y2, x1:x2]
+    rh, rw = roi.shape[:2]
+    if rh < 40 or rw < 80:
+        return None
+
+    def clean_text(text: str) -> str:
+        text = text.upper()
+        return re.sub(r"[^0-9A-ZА-Я-]", "", text)
+
+    def run_easyocr(img) -> str:
+        try:
+            res = OCR_READER.readtext(img, detail=0)
+        except Exception as e:
+            print(f"[OCR] error: {e}")
+            return ""
+        if not res:
+            return ""
+        candidate = max(res, key=len)
+        return clean_text(candidate)
+
+    mapping = {
+        "3": "Э",
+        "З": "Э",
+        "E": "Э",
+        "Ё": "Э",
+
+        "P": "Р",
+        "C": "С",
+        "X": "Х",
+        "Y": "У",
+        "A": "А",
+        "B": "В",
+        "K": "К",
+        "M": "М",
+        "H": "Н",
+        "O": "О",
+    }
+
+    def normalize_series(raw: str) -> str:
+        raw = clean_text(raw)
+        out = []
+        for ch in raw:
+            if ch.isdigit():
+                out.append(ch)
+            else:
+                out.append(mapping.get(ch, ch))
+        s = "".join(out)
+        if s and s[0] in {"3", "З", "E", "Ё"}:
+            s = "Э" + s[1:]
+        return s
+
+    # цифры справа
+    d_x1 = int(rw * 0.55)
+    d_x2 = int(rw * 0.98)
+    d_y1 = int(rh * 0.55)
+    d_y2 = int(rh * 0.98)
+
+    d_x1 = max(0, min(d_x1, rw - 1))
+    d_x2 = max(0, min(d_x2, rw))
+    d_y1 = max(0, min(d_y1, rh - 1))
+    d_y2 = max(0, min(d_y2, rh))
+
+    digits = ""
+    if d_x2 > d_x1 and d_y2 > d_y1:
+        digits_roi = roi[d_y1:d_y2, d_x1:d_x2]
+        if digits_roi.size > 0:
+            d_text = run_easyocr(digits_roi)
+            digits = re.sub(r"\D", "", d_text)
+            if len(digits) > 3:
+                digits = digits[-3:]
+            if len(digits) < 3:
+                digits = ""
+
+    # серия слева
+    s_x1 = int(rw * 0.02)
+    s_x2 = int(rw * 0.70)
+    s_y1 = int(rh * 0.35)
+    s_y2 = int(rh * 0.95)
+
+    s_x1 = max(0, min(s_x1, rw - 1))
+    s_x2 = max(0, min(s_x2, rw))
+    s_y1 = max(0, min(s_y1, rh - 1))
+    s_y2 = max(0, min(s_y2, rh))
+
+    series = ""
+    if s_x2 > s_x1 and s_y2 > s_y1:
+        series_roi = roi[s_y1:s_y2, s_x1:s_x2]
+        if series_roi.size > 0:
+            s_text = run_easyocr(series_roi)
+            series = normalize_series(s_text)
+            if len(series) < 2:
+                series = ""
+
+    # fallback по всей нижней части
+    if not series:
+        b_y1 = int(rh * 0.40)
+        b_y2 = int(rh * 0.99)
+        b_x1 = int(rw * 0.02)
+        b_x2 = int(rw * 0.98)
+
+        b_y1 = max(0, min(b_y1, rh - 1))
+        b_y2 = max(0, min(b_y2, rh))
+        b_x1 = max(0, min(b_x1, rw - 1))
+        b_x2 = max(0, min(b_x2, rw))
+
+        if b_x2 > b_x1 and b_y2 > b_y1:
+            bottom = roi[b_y1:b_y2, b_x1:b_x2]
+            if bottom.size > 0:
+                b_text_raw = run_easyocr(bottom)
+                b_text = normalize_series(b_text_raw)
+                m = re.search(r"[А-Я]{1,3}[0-9]{2}", b_text)
+                if m:
+                    series = m.group(0)
+
+    if series and digits:
+        return f"{series}-{digits}"
+    if digits:
+        return digits
+    if series:
+        return series
+    return None
+
+
+async def init_db():
+    await create_tables()
+
+
+async def save_frame_to_db(train_number, people_info, activity_index):
+    async with AsyncSessionLocal() as db:
+        await record_frame_activity(
+            db=db,
+            train_number=train_number,
+            people_info=people_info,
+            activity_index=activity_index,
+        )
+
+
+async def set_train_times_in_db(train_number, arrival_time, departure_time):
+    """
+    Обновляет времена поезда (по номеру).
+    ВАЖНО: обновляет только те поля, которые не None.
+    Если поезда не было — создаёт его.
+    """
+    fields = {}
+    if arrival_time is not None:
+        fields["arrival_time"] = arrival_time
+    if departure_time is not None:
+        fields["departure_time"] = departure_time
+
+    if not fields:
+        print("[DB][train_times] Нет полей для обновления, выходим")
+        return
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Train).where(Train.number == train_number))
+        train = result.scalar_one_or_none()
+
+        if train:
+            print(f"[DB][train_times] Обновляем поезд id={train.id}, поля={list(fields.keys())}")
+            await update_train(db, train_id=train.id, **fields)
+        else:
+            print(f"[DB][train_times] Поезд не найден, создаём: number={train_number}, поля={list(fields.keys())}")
+            await create_train(
+                db,
+                number=train_number,
+                arrival_time=fields.get("arrival_time"),
+                departure_time=fields.get("departure_time"),
+            )
+
 
 def point_in_rect(x, y, rect):
     x_min, y_min, x_max, y_max = rect
@@ -92,12 +317,6 @@ def point_in_rect(x, y, rect):
 
 
 def get_zone_label(cx, cy):
-    """
-    Возвращает:
-      'work' — рабочая зона
-      'walk' — проход
-      'other' — остальное
-    """
     if point_in_rect(cx, cy, WORK_ZONE):
         return "work"
     if point_in_rect(cx, cy, WALK_ZONE):
@@ -106,11 +325,6 @@ def get_zone_label(cx, cy):
 
 
 def point_in_polygon(x, y, polygon):
-    """
-    Классический ray casting алгоритм.
-    x, y — точка
-    polygon — список (x_i, y_i)
-    """
     n = len(polygon)
     if n < 3:
         return False
@@ -121,48 +335,41 @@ def point_in_polygon(x, y, polygon):
         xi, yi = polygon[i]
         xj, yj = polygon[j]
 
-        # Проверка, пересекает ли ребро луч справа от точки
-        intersect = ((yi > y) != (yj > y)) and \
-                    (x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi)
-        if intersect:
-            inside = not inside
+        if ((yi > y) != (yj > y)):
+            x_intersect = (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi
+            if x < x_intersect:
+                inside = not inside
         j = i
 
     return inside
 
 
 def classify_person_crop(crop_bgr, cls_model, cls_names):
-    """
-    Классификация кропа человека через YOLO-cls.
-    Возвращает:
-      role_label – строковая метка (напр. 'worker', 'other')
-      conf       – вероятность top1
-    """
     result = cls_model(crop_bgr, imgsz=224, verbose=False)[0]
     probs = result.probs
-    top1_id = int(probs.top1)
-    top1_conf = float(probs.top1conf)
-    role_label = cls_names[top1_id]
-    return role_label, top1_conf
+    top_idx = int(probs.top1)
+    role_label = cls_names[top_idx]
+    conf = float(probs.top1conf)
+    return role_label, conf
 
 
 def update_track_role(state, frame_idx, new_role, new_conf):
-    """
-    Обновление роли:
-      - игнорируем слабые предсказания
-      - current_role = мода по последним ROLE_WINDOW меткам
-    """
-    role_state = state.setdefault("role", {
-        "current_role": "",
-        "current_conf": 0.0,
-        "last_frame": -ROLE_RECLASSIFY_EVERY,
-        "labels_history": [],
-        "confs_history": [],
-    })
+    role_state = state.setdefault(
+        "role",
+        {
+            "current_role": "",
+            "current_conf": 0.0,
+            "last_frame": -ROLE_RECLASSIFY_EVERY,
+            "labels_history": [],
+            "confs_history": [],
+        },
+    )
 
     if new_conf < ROLE_CONF_MIN:
         role_state["last_frame"] = frame_idx
         return role_state
+
+    role_state["last_frame"] = frame_idx
 
     labels = role_state["labels_history"]
     confs = role_state["confs_history"]
@@ -174,33 +381,27 @@ def update_track_role(state, frame_idx, new_role, new_conf):
         labels[:] = labels[-ROLE_WINDOW:]
         confs[:] = confs[-ROLE_WINDOW:]
 
-    role_state["labels_history"] = labels
-    role_state["confs_history"] = confs
-
     counts = Counter(labels)
     most_common_role, _ = counts.most_common(1)[0]
-
     role_confs = [c for r, c in zip(labels, confs) if r == most_common_role]
-    avg_conf = sum(role_confs) / len(role_confs) if role_confs else new_conf
+    avg_conf = sum(role_confs) / max(1, len(role_confs))
 
     role_state["current_role"] = most_common_role
     role_state["current_conf"] = avg_conf
-    role_state["last_frame"] = frame_idx
+    role_state["labels_history"] = labels
+    role_state["confs_history"] = confs
 
     return role_state
 
 
 def update_track_motion(state, frame_idx, cx, cy, h, fps):
-    """
-    Обновляет:
-      - историю позиций
-      - скорость (px/сек)
-      (высоту можно оставить на будущее, сейчас не используем)
-    """
-    motion = state.setdefault("motion", {
-        "positions": [],
-        "speed": 0.0,
-    })
+    motion = state.setdefault(
+        "motion",
+        {
+            "positions": [],
+            "speed": 0.0,
+        },
+    )
 
     positions = motion["positions"]
     positions.append((frame_idx, cx, cy))
@@ -222,32 +423,35 @@ def update_track_motion(state, frame_idx, cx, cy, h, fps):
 
 
 def infer_activity(zone, speed, in_train_zone):
-    """
-    Простая и понятная логика активности:
-      - если человек в полигоне поезда → working
-      - иначе:
-          speed > WALK_SPEED_MIN  → walking
-          speed < STILL_MAX_SPEED → idle
-          иначе → walking (чтоб не плодить лишние состояния)
-    """
     if in_train_zone:
         return "working"
-
-    if speed > WALK_SPEED_MIN:
-        return "walking"
-
-    if speed < STILL_MAX_SPEED:
+    if speed <= STILL_MAX_SPEED:
         return "idle"
+    if WALK_SPEED_MIN <= speed <= WALK_SPEED_MAX:
+        return "walking"
+    return "idle"
 
-    return "walking"
-
-
-# ==============================
-#               MAIN
-# ==============================
 
 def main():
-    global WORK_ZONE, WALK_ZONE, FPS, TRAIN_POLYGON
+    global WORK_ZONE, WALK_ZONE, FPS, TRAIN_POLYGON, MIN_TRAIN_PRESENCE_FRAMES
+
+    # Инициализируем БД в отдельном event loop
+    asyncio.run(init_db())
+
+
+    current_train_number = None
+    ocr_votes = Counter()
+
+    train_present_prev = False
+    train_absent_streak = 0
+    train_present_duration_frames = 0
+    episode_start_frame = None
+
+    train_arrival_time = None
+    train_departure_time = None
+
+    last_alert_frame = -10_000_000
+    Path(SCREENSHOT_DIR).mkdir(parents=True, exist_ok=True)
 
     if not Path(VIDEO_PATH).exists():
         raise FileNotFoundError(f"Видео не найдено: {VIDEO_PATH}")
@@ -263,23 +467,24 @@ def main():
 
     cap.release()
 
-    print(f"Видео: {width}x{height}, FPS={fps:.2f}")
+    effective_fps_for_presence = fps / FRAME_STRIDE
+    MIN_TRAIN_PRESENCE_FRAMES = max(10, int(effective_fps_for_presence * 1.5))
 
-    # Зоны "проход" и "работа" — для меток, не для логики working
+    print(f"Видео: {width}x{height}, FPS={fps:.2f}")
+    print(f"FRAME_STRIDE = {FRAME_STRIDE}")
+    print(f"MIN_TRAIN_PRESENCE_FRAMES = {MIN_TRAIN_PRESENCE_FRAMES}")
+
     WALK_ZONE = (0, 0, int(width * 0.48), height)
     WORK_ZONE = (int(width * 0.48), 0, width, height)
 
-    # Полигон поезда в пикселях
-    TRAIN_POLYGON = [
-        (int(x * width), int(y * height))
-        for (x, y) in TRAIN_POLYGON_NORM
+    TRAIN_POLYGON[:] = [
+        (int(x * width), int(y * height)) for (x, y) in TRAIN_POLYGON_NORM
     ]
 
     print(f"WORK_ZONE: {WORK_ZONE}")
     print(f"WALK_ZONE: {WALK_ZONE}")
     print(f"TRAIN_POLYGON: {TRAIN_POLYGON}")
 
-    # тепловая карта (downscaled)
     heatmap_h = height // HEATMAP_DOWNSCALE
     heatmap_w = width // HEATMAP_DOWNSCALE
     heatmap = np.zeros((heatmap_h, heatmap_w), dtype=np.float32)
@@ -295,15 +500,26 @@ def main():
     Path(OUTPUT_CSV_PATH).parent.mkdir(parents=True, exist_ok=True)
     csv_file = open(OUTPUT_CSV_PATH, "w", newline="", encoding="utf-8")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
-        "frame", "track_id", "det_class_id", "det_class_name",
-        "x1", "y1", "x2", "y2",
-        "role", "role_conf",
-        "speed_px_per_sec", "zone",
-        "in_train_polygon", "activity"
-    ])
+    csv_writer.writerow(
+        [
+            "frame",
+            "track_id",
+            "det_class_id",
+            "det_class_name",
+            "x1",
+            "y1",
+            "x2",
+            "y2",
+            "role",
+            "role_conf",
+            "speed_px_per_sec",
+            "zone",
+            "in_train_polygon",
+            "activity",
+        ]
+    )
 
-    track_states = {}   # track_id -> state
+    track_states = {}
 
     results_gen = det_model.track(
         source=VIDEO_PATH,
@@ -318,22 +534,36 @@ def main():
     )
 
     print("Старт обработки...")
+    last_frame_idx = -1
 
     for frame_idx, result in enumerate(results_gen):
+        last_frame_idx = frame_idx
         frame = result.orig_img
-        boxes = result.boxes
 
-        if boxes is None or len(boxes) == 0:
+        if frame_idx % FRAME_STRIDE != 0:
             out_writer.write(frame)
             continue
 
-        xyxy = boxes.xyxy.cpu().numpy()
-        cls_arr = boxes.cls.cpu().numpy()
-        ids = boxes.id
-        if ids is not None:
-            ids = ids.cpu().numpy()
+        boxes = result.boxes
+
+        frame_people = []
+        total_persons = 0
+        working_persons = 0
+
+        train_detected_raw = False
+
+        if boxes is None or len(boxes) == 0:
+            xyxy = np.empty((0, 4), dtype=float)
+            cls_arr = np.empty((0,), dtype=float)
+            ids = []
         else:
-            ids = [-1] * len(xyxy)
+            xyxy = boxes.xyxy.cpu().numpy()
+            cls_arr = boxes.cls.cpu().numpy()
+            ids = boxes.id
+            if ids is not None:
+                ids = ids.cpu().numpy()
+            else:
+                ids = [-1] * len(xyxy)
 
         h_frame, w_frame = frame.shape[:2]
 
@@ -349,6 +579,35 @@ def main():
                 det_class_name = "train"
             else:
                 det_class_name = f"class_{class_id}"
+
+            # поезд
+            if det_class_name == "train":
+                train_detected_raw = True
+
+                if (
+                    current_train_number is None
+                    and w >= MIN_TRAIN_OCR_W
+                    and h >= MIN_TRAIN_OCR_H
+                ):
+                    candidate = ocr_train_number_from_bbox(frame, (x1, y1, x2, y2))
+                    if candidate:
+                        ocr_votes[candidate] += 1
+                        best_candidate, best_votes = ocr_votes.most_common(1)[0]
+                        if best_votes >= MIN_OCR_VOTES and current_train_number is None:
+                            current_train_number = best_candidate
+                            print(
+                                f"[OCR] Номер поезда принят по голосованию: "
+                                f"{current_train_number} (кадров: {best_votes})"
+                            )
+                            if (
+                                episode_start_frame is not None
+                                and train_arrival_time is None
+                            ):
+                                train_arrival_time = datetime.utcnow()
+                                print(
+                                    f"[TRAIN] Прибытие поезда (OCR позже, PC time): "
+                                    f"{train_arrival_time}"
+                                )
 
             current_role = ""
             role_conf = 0.0
@@ -368,19 +627,20 @@ def main():
                 cx = (x1 + x2) / 2.0
                 cy = (y1 + y2) / 2.0
 
-                # движение
                 update_track_motion(state, frame_idx, cx, cy, h, fps)
                 motion_state = state.get("motion", {})
                 speed = motion_state.get("speed", 0.0)
 
-                # роль
-                role_state = state.setdefault("role", {
-                    "current_role": "",
-                    "current_conf": 0.0,
-                    "last_frame": -ROLE_RECLASSIFY_EVERY,
-                    "labels_history": [],
-                    "confs_history": [],
-                })
+                role_state = state.setdefault(
+                    "role",
+                    {
+                        "current_role": "",
+                        "current_conf": 0.0,
+                        "last_frame": -ROLE_RECLASSIFY_EVERY,
+                        "labels_history": [],
+                        "confs_history": [],
+                    },
+                )
 
                 need_role_cls = False
                 if h >= MIN_PERSON_H and w >= MIN_PERSON_W:
@@ -396,8 +656,12 @@ def main():
                     y2c = max(0, min(y2, h_frame - 1))
                     crop = frame[y1c:y2c, x1c:x2c]
                     if crop.size > 0:
-                        role_label, conf = classify_person_crop(crop, cls_model, cls_names)
-                        role_state = update_track_role(state, frame_idx, role_label, conf)
+                        role_label, conf = classify_person_crop(
+                            crop, cls_model, cls_names
+                        )
+                        role_state = update_track_role(
+                            state, frame_idx, role_label, conf
+                        )
 
                 current_role = role_state["current_role"]
                 role_conf = role_state["current_conf"]
@@ -405,45 +669,71 @@ def main():
                 zone = get_zone_label(cx, cy)
                 in_train_poly = point_in_polygon(cx, cy, TRAIN_POLYGON)
 
-                # активность + сглаживание по окну
-                activity_state = state.setdefault("activity", {
-                    "current_activity": "",
-                    "history": [],
-                })
+                activity_state = state.setdefault(
+                    "activity",
+                    {
+                        "current_activity": "",
+                        "history": [],
+                    },
+                )
                 raw_activity = infer_activity(zone, speed, in_train_poly)
-
                 hist = activity_state["history"]
                 hist.append(raw_activity)
                 if len(hist) > ACTIVITY_WINDOW:
                     hist[:] = hist[-ACTIVITY_WINDOW:]
-
                 counts = Counter(hist)
                 current_activity, _ = counts.most_common(1)[0]
                 activity_state["current_activity"] = current_activity
 
-                # тепловая карта: все, кто "working" (без проверки роли)
+                # триггер скриншота
+                if zone == "work" and current_role and current_role.lower() == "other":
+                    if (frame_idx - last_alert_frame) >= ALERT_COOLDOWN_SEC * fps:
+                        last_alert_frame = frame_idx
+                        sec_from_start = frame_idx / fps if fps else 0.0
+                        time_delta = timedelta(seconds=sec_from_start)
+                        time_str = str(time_delta)
+                        safe_time_str = time_str.replace(":", "-").replace(".", "-")
+                        filename = f"{safe_time_str}.jpg"
+                        save_path = Path(SCREENSHOT_DIR) / filename
+                        cv2.imwrite(str(save_path), frame)
+                        print(
+                            f"[ALERT] OTHER в рабочей зоне у поезда: "
+                            f"frame={frame_idx}, t={sec_from_start:.2f} c → {save_path}"
+                        )
+
+                total_persons += 1
+                if current_activity == "working":
+                    working_persons += 1
+
+                status = "active" if current_activity == "working" else "idle"
+                frame_people.append(
+                    {
+                        "worker_type": current_role or "unknown",
+                        "status": status,
+                    }
+                )
+
                 if current_activity == "working":
                     hx = int(cx / HEATMAP_DOWNSCALE)
                     hy = int(cy / HEATMAP_DOWNSCALE)
                     if 0 <= hx < heatmap_w and 0 <= hy < heatmap_h:
                         heatmap[hy, hx] += 1.0
 
-            # --- цвет бокса ---
+            # отрисовка
             if det_class_name == "person":
                 if current_activity == "working":
-                    color = (0, 255, 0)        # зелёный — работает
+                    color = (0, 255, 0)
                 elif current_activity == "walking":
-                    color = (255, 255, 0)      # жёлтый — идёт
+                    color = (255, 255, 0)
                 elif current_activity == "idle":
-                    color = (0, 215, 255)      # оранжевый — стоит
+                    color = (0, 215, 255)
                 else:
-                    color = (0, 255, 255)      # если что-то не определилось
+                    color = (0, 255, 255)
             elif det_class_name == "train":
-                color = (0, 0, 255)            # красный — поезд
+                color = (0, 0, 255)
             else:
                 color = (255, 0, 255)
 
-            # --- рисуем ---
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
             label_parts = [det_class_name]
@@ -455,26 +745,102 @@ def main():
                 label_parts.append(current_activity)
 
             label_text = " | ".join(label_parts)
-
             cv2.putText(
-                frame, label_text, (x1, max(0, y1 - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA
+                frame,
+                label_text,
+                (x1, max(0, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+                cv2.LINE_AA,
             )
 
-            # --- лог ---
-            csv_writer.writerow([
-                frame_idx,
-                int(track_id) if track_id != -1 else -1,
-                class_id,
-                det_class_name,
-                x1, y1, x2, y2,
-                current_role,
-                f"{role_conf:.3f}",
-                f"{speed:.1f}",
-                zone,
-                int(in_train_poly),
-                current_activity,
-            ])
+            csv_writer.writerow(
+                [
+                    frame_idx,
+                    int(track_id) if track_id != -1 else -1,
+                    class_id,
+                    det_class_name,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    current_role,
+                    f"{role_conf:.3f}",
+                    f"{speed:.1f}",
+                    zone,
+                    int(in_train_poly),
+                    current_activity,
+                ]
+            )
+
+        # логика присутствия поезда
+        if train_detected_raw:
+            train_absent_streak = 0
+        else:
+            train_absent_streak += 1
+
+        if train_detected_raw or (
+            train_present_prev and train_absent_streak <= TRAIN_ABSENT_GRACE_FRAMES
+        ):
+            train_present_this = True
+        else:
+            train_present_this = False
+
+        if train_present_this and not train_present_prev:
+            episode_start_frame = frame_idx
+            train_present_duration_frames = 1
+            print(f"[TRAIN] Поезд появился в кадре: frame={frame_idx}")
+        elif train_present_this and train_present_prev:
+            train_present_duration_frames += 1
+
+        if (
+            train_present_this
+            and current_train_number is not None
+            and train_arrival_time is None
+            and episode_start_frame is not None
+            and train_present_duration_frames >= MIN_TRAIN_PRESENCE_FRAMES
+        ):
+            train_arrival_time = datetime.utcnow()
+            print(
+                f"[TRAIN] Прибытие поезда (PC time): {train_arrival_time}"
+            )
+
+        if (not train_present_this) and train_present_prev:
+            if (
+                train_present_duration_frames >= MIN_TRAIN_PRESENCE_FRAMES
+                and current_train_number is not None
+            ):
+                train_departure_time = datetime.utcnow()
+                print(
+                    f"[TRAIN] Отбытие поезда (PC time): {train_departure_time}"
+                )
+            else:
+                print(
+                    f"[TRAIN] Короткий шум поезда, игнорируем эпизод "
+                    f"(duration={train_present_duration_frames})"
+                )
+
+            train_present_duration_frames = 0
+            episode_start_frame = None
+
+        train_present_prev = train_present_this
+
+        if current_train_number is not None and total_persons > 0:
+            activity_index = (
+                working_persons / total_persons if total_persons > 0 else 0.0
+            )
+            try:
+                loop.run_until_complete(
+                    save_frame_to_db(
+                        current_train_number,
+                        frame_people,
+                        activity_index,
+                    )
+                )
+            except Exception as e:
+                print(f"[DB] Ошибка записи кадра в БД: {e}")
 
         out_writer.write(frame)
 
@@ -484,16 +850,45 @@ def main():
     csv_file.close()
     cv2.destroyAllWindows()
 
-    # ==============================
-    #   ГЕНЕРАЦИЯ ТЕПЛОВОЙ КАРТЫ
-    # ==============================
+    # финализация departure, если поезд остался "в кадре" к концу видео
+    if (
+        current_train_number
+        and train_arrival_time
+        and not train_departure_time
+        and last_frame_idx >= 0
+    ):
+        train_departure_time = datetime.utcnow()
+        print(
+            f"[TRAIN] Отбытие поезда по концу видео (PC time): {train_departure_time}"
+        )
+
+    # отправляем времена поезда в БД (arrival и/или departure)
+    if current_train_number:
+        try:
+            print(
+                f"[DB] Пишем времена поезда {current_train_number}: "
+                f"arrival={train_arrival_time}, departure={train_departure_time}"
+            )
+            loop.run_until_complete(
+                set_train_times_in_db(
+                    current_train_number,
+                    train_arrival_time,
+                    train_departure_time,
+                )
+            )
+        except Exception as e:
+            print(f"[DB] Ошибка обновления времён поезда: {e}")
+    else:
+        print("[TRAIN] Номер поезда не распознан, времена не записаны в БД.")
 
     if np.max(heatmap) > 0:
         heat_norm = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX)
         heat_uint8 = heat_norm.astype(np.uint8)
         heat_color = cv2.applyColorMap(heat_uint8, cv2.COLORMAP_JET)
-        heat_color_resized = cv2.resize(heat_color, (width, height), interpolation=cv2.INTER_LINEAR)
-
+        heat_color_resized = cv2.resize(
+            heat_color, (width, height), interpolation=cv2.INTER_LINEAR
+        )
+        Path(OUTPUT_HEATMAP_PATH).parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(OUTPUT_HEATMAP_PATH, heat_color_resized)
         print(f"Тепловая карта сохранена в: {OUTPUT_HEATMAP_PATH}")
     else:
@@ -501,6 +896,8 @@ def main():
 
     print(f"Видео сохранено в: {OUTPUT_VIDEO_PATH}")
     print(f"CSV лог:          {OUTPUT_CSV_PATH}")
+
+    loop.close()
 
 
 if __name__ == "__main__":
