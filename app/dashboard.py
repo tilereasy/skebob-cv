@@ -2,15 +2,12 @@ import os
 from pathlib import Path
 from typing import Tuple, Optional
 
-import asyncio
 import pandas as pd
 import plotly.graph_objects as go
 import gradio as gr
 
-# Импорт моделей и сессии из вашего db_app.py (не трогаем)
 from db_app import AsyncSessionLocal, Train, Second, SecondsPeople, People
-from sqlalchemy import select, func
-
+from sqlalchemy import select
 
 # --------------------
 # Пути и окружение
@@ -21,11 +18,13 @@ PROJECT_ROOT = APP_DIR.parent
 INPUT_DIR = PROJECT_ROOT / "data" / "input"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "output"
 
-# Имя файла видео
+# Файлы медиа
 VIDEO_FILENAME = "video.mov"
 VIDEO_PATH = INPUT_DIR / VIDEO_FILENAME
+
 LABELED_VIDEO_FILENAME = "result.mov"
 LABELED_VIDEO_PATH = OUTPUT_DIR / LABELED_VIDEO_FILENAME
+
 HEATMAP_FILENAME = "heatmap.png"
 HEATMAP_PATH = OUTPUT_DIR / HEATMAP_FILENAME
 
@@ -35,126 +34,22 @@ print("INPUT_DIR    =", INPUT_DIR)
 print("OUTPUT_DIR   =", OUTPUT_DIR)
 print("VIDEO_PATH   =", VIDEO_PATH, "| exists:", VIDEO_PATH.exists())
 
-# Формат видео определяем по расширению файла.
 if VIDEO_PATH.exists():
     VIDEO_FORMAT = VIDEO_PATH.suffix[1:].lower() or "mov"
 else:
     VIDEO_FORMAT = "mov"
 
-# Путь к медиа
 VIDEO_PATHS = {
     "Видео": VIDEO_PATH,
     "Размеченное видео": LABELED_VIDEO_PATH,
-    # для теплокарты будем использовать HEATMAP_PATH, но уже в gr.Image
+    # "Тепловая карта" — отдельный gr.Image, см. ниже
 }
 
-# Поезд, для которого строим дашборд.
 TRAIN_NUMBER = os.getenv("TRAIN_NUMBER", "Train-001")
 
 
 # --------------------
-# Загрузка данных из БД (агрегаты для графика/KPI)
-# --------------------
-
-async def _load_data_from_db(train_number: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Загружает данные для дашборда из PostgreSQL по номеру поезда.
-    """
-    async with AsyncSessionLocal() as db:
-        # 1) seconds
-        q_sec = (
-            select(
-                Second.id,
-                Second.sequence_number,
-                Second.people_count,
-                Second.active_people_count,
-                Second.activity_index,
-            )
-            .join(Train, Train.id == Second.train_id)
-            .where(Train.number == train_number)
-            .order_by(Second.sequence_number)
-        )
-        res_sec = await db.execute(q_sec)
-        sec_rows = res_sec.all()
-        seconds_df = pd.DataFrame(
-            sec_rows,
-            columns=[
-                "id",
-                "sequence_number",
-                "people_count",
-                "active_people_count",
-                "activity_index",
-            ],
-        )
-
-        # 2) people
-        q_people = (
-            select(People.id, People.worker_type)
-            .join(SecondsPeople, SecondsPeople.person_id == People.id)
-            .join(Second, Second.id == SecondsPeople.second_id)
-            .join(Train, Train.id == Second.train_id)
-            .where(Train.number == train_number)
-            .distinct()
-        )
-        res_people = await db.execute(q_people)
-        people_rows = res_people.all()
-        people_df = pd.DataFrame(people_rows, columns=["id", "worker_type"])
-
-        # 3) seconds_people
-        q_sp = (
-            select(
-                SecondsPeople.id,
-                SecondsPeople.person_id,
-                SecondsPeople.second_id,
-                SecondsPeople.status,
-            )
-            .join(Second, Second.id == SecondsPeople.second_id)
-            .join(Train, Train.id == Second.train_id)
-            .where(Train.number == train_number)
-        )
-        res_sp = await db.execute(q_sp)
-        sp_rows = res_sp.all()
-        seconds_people_df = pd.DataFrame(
-            sp_rows,
-            columns=["id", "person_id", "second_id", "status"],
-        )
-
-    return seconds_df, people_df, seconds_people_df
-
-
-async def _load_train_info(train_number: str) -> Optional[Train]:
-    async with AsyncSessionLocal() as db:
-        res = await db.execute(select(Train).where(Train.number == train_number))
-        return res.scalar_one_or_none()
-
-
-async def _init_all(train_number: str):
-    seconds_df, people_df, seconds_people_df = await _load_data_from_db(train_number)
-    train_obj = await _load_train_info(train_number)
-    return seconds_df, people_df, seconds_people_df, train_obj
-
-
-# Глобальные DataFrame'ы для графика/KPI + объект поезда.
-try:
-    SECONDS_DF, PEOPLE_DF, SECONDS_PEOPLE_DF, TRAIN_OBJ = asyncio.run(_init_all(TRAIN_NUMBER))
-    print(
-        f"Loaded data for train '{TRAIN_NUMBER}': "
-        f"{len(SECONDS_DF)} seconds, "
-        f"{len(PEOPLE_DF)} people, "
-        f"{len(SECONDS_PEOPLE_DF)} seconds_people."
-    )
-except Exception as e:
-    print(f"Failed to load data from DB for train '{TRAIN_NUMBER}': {e}")
-    SECONDS_DF = pd.DataFrame(
-        columns=["id", "sequence_number", "people_count", "active_people_count", "activity_index"]
-    )
-    PEOPLE_DF = pd.DataFrame(columns=["id", "worker_type"])
-    SECONDS_PEOPLE_DF = pd.DataFrame(columns=["id", "person_id", "second_id", "status"])
-    TRAIN_OBJ = None
-
-
-# --------------------
-# Функции для отображения
+# Вспомогательные функции рендера
 # --------------------
 
 def make_main_figure(seconds_df: pd.DataFrame) -> go.Figure:
@@ -257,76 +152,97 @@ def train_info_markdown(train: Optional[Train]) -> str:
     return md
 
 
-async def _table_at_time_async(train_number: str, t_sec: float) -> pd.DataFrame:
+# --------------------
+# Работа с БД (всё async, без asyncio.run)
+# --------------------
+
+async def load_seconds_df(db, train_number: str) -> pd.DataFrame:
     """
-    1. sequence_number ~= t_sec
-    2. находим Second для этого поезда
-    3. по second_id берём SecondsPeople + People
+    seconds_df для поезда:
+    - id
+    - sequence_number
+    - people_count
+    - active_people_count
+    - activity_index
     """
-    if SECONDS_DF.empty:
+    q_sec = (
+        select(
+            Second.id,
+            Second.sequence_number,
+            Second.people_count,
+            Second.active_people_count,
+            Second.activity_index,
+        )
+        .join(Train, Train.id == Second.train_id)
+        .where(Train.number == train_number)
+        .order_by(Second.sequence_number)
+    )
+    res_sec = await db.execute(q_sec)
+    rows = res_sec.all()
+    return pd.DataFrame(
+        rows,
+        columns=["id", "sequence_number", "people_count", "active_people_count", "activity_index"],
+    )
+
+
+async def load_train(db, train_number: str) -> Optional[Train]:
+    res = await db.execute(select(Train).where(Train.number == train_number))
+    return res.scalar_one_or_none()
+
+
+async def table_at_time_async(db, train_number: str, t_sec: float) -> pd.DataFrame:
+    """
+    Алгоритм:
+      1. Определяем整数 sequence_number ~ t_sec (>=1).
+      2. Находим Second для этого поезда и sequence_number.
+      3. По second_id берём SecondsPeople + People.
+      4. Возвращаем DataFrame[id, worker_type, status].
+    """
+    # sequence_number: просто int(round(t_sec)), минимально 1
+    seq = int(round(float(t_sec or 0.0)))
+    if seq < 1:
+        seq = 1
+
+    # 1) Находим second_id для этого поезда и sequence_number
+    q_second = (
+        select(Second.id)
+        .join(Train, Train.id == Second.train_id)
+        .where(Train.number == train_number, Second.sequence_number == seq)
+    )
+    res_second = await db.execute(q_second)
+    second_id = res_second.scalar_one_or_none()
+
+    if second_id is None:
         return pd.DataFrame(columns=["id", "worker_type", "status"])
 
-    seq_min = int(SECONDS_DF["sequence_number"].min())
-    seq_max = int(SECONDS_DF["sequence_number"].max())
+    # 2) Люди в эту секунду
+    q_people_at_time = (
+        select(People.id, People.worker_type, SecondsPeople.status)
+        .join(SecondsPeople, SecondsPeople.person_id == People.id)
+        .where(SecondsPeople.second_id == second_id)
+        .order_by(People.id)
+    )
+    res_people = await db.execute(q_people_at_time)
+    rows = res_people.all()
 
-    seq = int(round(float(t_sec or 0.0)))
-    seq = max(seq_min, min(seq, seq_max))
+    if not rows:
+        return pd.DataFrame(columns=["id", "worker_type", "status"])
 
-    async with AsyncSessionLocal() as db:
-        q_second = (
-            select(Second.id)
-            .join(Train, Train.id == Second.train_id)
-            .where(Train.number == train_number, Second.sequence_number == seq)
-        )
-        res_second = await db.execute(q_second)
-        second_id = res_second.scalar_one_or_none()
-
-        if second_id is None:
-            return pd.DataFrame(columns=["id", "worker_type", "status"])
-
-        q_people_at_time = (
-            select(People.id, People.worker_type, SecondsPeople.status)
-            .join(SecondsPeople, SecondsPeople.person_id == People.id)
-            .where(SecondsPeople.second_id == second_id)
-            .order_by(People.id)
-        )
-        res_people = await db.execute(q_people_at_time)
-        rows = res_people.all()
-
-        if not rows:
-            return pd.DataFrame(columns=["id", "worker_type", "status"])
-
-        df = pd.DataFrame(rows, columns=["id", "worker_type", "status"])
-        df = df.sort_values("id").reset_index(drop=True)
-        return df
+    df = pd.DataFrame(rows, columns=["id", "worker_type", "status"])
+    df = df.sort_values("id").reset_index(drop=True)
+    return df
 
 
-def table_at_time(t_sec: float) -> pd.DataFrame:
-    return asyncio.run(_table_at_time_async(TRAIN_NUMBER, t_sec))
+# --------------------
+# Переключение видео / теплокарты
+# --------------------
 
-
-def update_by_time(current_t: float):
-    t = float(current_t or 0.0)
-
-    fig = make_main_figure(SECONDS_DF)
-
-    try:
-        tbl = table_at_time(t)
-    except Exception as e:
-        print(f"Failed to build table_at_time({t}): {e}")
-        tbl = pd.DataFrame(columns=["id", "worker_type", "status"])
-
-    return fig, tbl, t
-
-
-# --- НОВАЯ функция переключения между видео и картинкой ---  # NEW
 def switch_media(mode: str):
     """
     Переключает:
       - 'Видео' / 'Размеченное видео' -> gr.Video
       - 'Тепловая карта'             -> gr.Image
     """
-    # дефолт: всё скрыто
     video_update = gr.update(visible=False)
     heatmap_update = gr.update(visible=False)
 
@@ -352,17 +268,53 @@ def switch_media(mode: str):
             heatmap_update = gr.update(value=None, visible=True)
 
     return video_update, heatmap_update
-# ----------------------------------------------------------
 
 
 # --------------------
-# Предварительно построенные объекты
+# Основной callback: ВСЁ из БД по текущему времени
 # --------------------
 
-INIT_FIG = make_main_figure(SECONDS_DF)
-INIT_TABLE = table_at_time(0.0)
-INIT_KPI = kpi_markdown(SECONDS_DF)
-TRAIN_INFO_MD = train_info_markdown(TRAIN_OBJ)
+async def update_by_time(current_t: float):
+    """
+    Вызывается на каждый тик таймера.
+    Делает:
+      - seconds_df для поезда -> график и KPI;
+      - second по sequence_number ~ current_t -> таблица людей;
+      - Train -> плашка поезда.
+    """
+    t = float(current_t or 0.0)
+
+    async with AsyncSessionLocal() as db:
+        # seconds (для графика и KPI)
+        seconds_df = await load_seconds_df(db, TRAIN_NUMBER)
+
+        # таблица людей на текущую секунду
+        table_df = await table_at_time_async(db, TRAIN_NUMBER, t)
+
+        # информация о поезде
+        train_obj = await load_train(db, TRAIN_NUMBER)
+
+    fig = make_main_figure(seconds_df)
+    kpi_md = kpi_markdown(seconds_df)
+    train_md = train_info_markdown(train_obj)
+
+    # возвращаем:
+    # - график
+    # - таблицу
+    # - текущее время (state)
+    # - KPI
+    # - плашку поезда
+    return fig, table_df, t, kpi_md, train_md
+
+
+# --------------------
+# Предварительные значения (пока без БД)
+# --------------------
+
+EMPTY_TABLE = pd.DataFrame(columns=["id", "worker_type", "status"])
+EMPTY_FIG = go.Figure()
+INIT_KPI = f"Загрузка данных по поезду **{TRAIN_NUMBER}**..."
+INIT_TRAIN_MD = f"Загрузка информации о поезде **{TRAIN_NUMBER}**..."
 
 
 # --------------------
@@ -406,7 +358,7 @@ with gr.Blocks() as demo:
 
     with gr.Row():
         with gr.Column(scale=3):
-            # Видео (по умолчанию видно)                         # CHANGED: добавили visible
+            # Видео по умолчанию
             video = gr.Video(
                 value=str(VIDEO_PATH) if VIDEO_PATH.exists() else None,
                 format=VIDEO_FORMAT,
@@ -415,7 +367,7 @@ with gr.Blocks() as demo:
                 visible=True,
             )
 
-            # Картинка теплокарты (по умолчанию скрыта)          # NEW
+            # Картинка теплокарты (скрыта по умолчанию)
             heatmap_image = gr.Image(
                 value=str(HEATMAP_PATH) if HEATMAP_PATH.exists() else None,
                 label="Тепловая карта",
@@ -430,14 +382,14 @@ with gr.Blocks() as demo:
 
             table_now = gr.Dataframe(
                 headers=["id", "worker_type", "status"],
-                value=INIT_TABLE,
+                value=EMPTY_TABLE,
                 label="Таблица с тем, что сейчас на экране",
                 interactive=False,
                 wrap=True,
             )
 
         with gr.Column(scale=2):
-            train_box = gr.Markdown(value=TRAIN_INFO_MD)
+            train_box = gr.Markdown(value=INIT_TRAIN_MD)
             kpi_box = gr.Markdown(value=INIT_KPI)
 
             with gr.Accordion("Danger highlights (картинки)", open=True):
@@ -449,9 +401,10 @@ with gr.Blocks() as demo:
 
             with gr.Accordion("График людей, работающих людей и индекса активности", open=True):
                 main_plot = gr.Plot(
-                    value=INIT_FIG,
+                    value=EMPTY_FIG,
                 )
 
+    # Таймер
     timer = gr.Timer(0.5)
 
     timer.tick(
@@ -459,13 +412,14 @@ with gr.Blocks() as demo:
         outputs=current_time,
     )
 
+    # async callback: Gradio сам await-ит update_by_time
     current_time.change(
         fn=update_by_time,
         inputs=current_time,
-        outputs=[main_plot, table_now, time_state],
+        outputs=[main_plot, table_now, time_state, kpi_box, train_box],
     )
 
-    # Переключение режима: видео <-> теплокарта              # CHANGED
+    # Переключение режимов: видео / теплокарта
     mode_radio.change(
         fn=switch_media,
         inputs=mode_radio,
@@ -474,7 +428,6 @@ with gr.Blocks() as demo:
 
 
 if __name__ == "__main__":
-    # VIDEO_DIR у тебя уже нет – используем INPUT/OUTPUT      # CHANGED
     demo.launch(
         debug=True,
         allowed_paths=[str(INPUT_DIR), str(OUTPUT_DIR)],
