@@ -433,6 +433,9 @@ def infer_activity(zone, speed, in_train_zone):
 
 
 def main():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     global WORK_ZONE, WALK_ZONE, FPS, TRAIN_POLYGON, MIN_TRAIN_PRESENCE_FRAMES
 
     # Инициализируем БД в отдельном event loop
