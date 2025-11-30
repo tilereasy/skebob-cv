@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+APP_ROOT="${APP_ROOT:-/workspace}"
 MODE="${APP_MODE:-all}"
+
+export PYTHONPATH="${APP_ROOT}:${PYTHONPATH:-}"
+cd "${APP_ROOT}"
 
 if [[ "${SKIP_DB_BOOTSTRAP:-0}" != "1" ]]; then
   python - <<'PY'
@@ -43,4 +47,4 @@ asyncio.run(bootstrap())
 PY
 fi
 
-exec python app/run_app.py --mode "${MODE}"
+exec python "${APP_ROOT}/app/run_app.py" --mode "${MODE}"

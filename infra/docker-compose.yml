@@ -27,12 +27,11 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@postgres:5432/postgres}
       APP_MODE: ${APP_MODE:-all}
       SKIP_DB_BOOTSTRAP: ${SKIP_DB_BOOTSTRAP:-0}
+      APP_ROOT: ${APP_ROOT:-/workspace}
     ports:
       - "${APP_HTTP_PORT:-7860}:7860"
     volumes:
-      - ../data:/app/data
-      - ../datasets:/app/datasets
-      - ../models:/app/models
+      - ..:/workspace
 
 volumes:
   postgres_data:
