@@ -634,5 +634,68 @@ with gr.Blocks(title="Train Activity Dashboard") as demo:
         # ПРАВАЯ КОЛОНКА: KPI, опасные моменты, график
         with gr.Column(scale=2):
             kpi_markdown = gr.Markdown(
-                value="### KPI по
+                value="### KPI по видео\n\nЗагрузка...",
+                label="KPI",
+            )
 
+            danger_gallery = gr.Gallery(
+                label="Опасные моменты (скриншоты)",
+                columns=3,
+                rows=2,
+                preview=True,
+                height=220,
+            )
+
+            activity_plot = gr.Plot(
+                label="График: количество людей, работающих людей и индекс активности",
+            )
+
+    # ----------------- СВЯЗЫВАНИЕ ОБРАБОТЧИКОВ -----------------
+
+    # Инициализация при загрузке
+    demo.load(
+        fn=on_app_load,
+        inputs=None,
+        outputs=[
+            train_selector,
+            train_info,
+            second_slider,
+            kpi_markdown,
+            danger_gallery,
+            activity_plot,
+            people_table,
+        ],
+    )
+
+    # Смена поезда
+    train_selector.change(
+        fn=on_train_change,
+        inputs=[train_selector],
+        outputs=[
+            train_info,
+            second_slider,
+            kpi_markdown,
+            danger_gallery,
+            activity_plot,
+            people_table,
+        ],
+    )
+
+    # Перемотка по секундам
+    second_slider.change(
+        fn=on_second_change,
+        inputs=[train_selector, second_slider],
+        outputs=[activity_plot, people_table],
+    )
+
+    # Переключение режима (видео / размеченное / тепловая карта)
+    mode_radio.change(
+        fn=on_mode_change,
+        inputs=[mode_radio],
+        outputs=[video_player, heatmap_image],
+    )
+
+
+if __name__ == "__main__":
+    # queue=True позволяет нормально работать с async-обработчиками
+    demo.queue().launch()
